@@ -1,0 +1,225 @@
+--- a/pim_ui/includes/pimShortcutMgr.h
++++ b/pim_ui/includes/pimShortcutMgr.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -18,44 +18,213 @@
+ #include <pimCore.h>
+ #include <pimXmlFile.h>
+ 
++/**
++ * Lightweight, non-owning wrapper over a product's <SHORTCUT> XML elements,
++ * providing a query/mutation API independent of pimShortcutLoop/pimShortcuts
++ * (the install-time class family). Always constructed stack-local and
++ * short-lived; never a singleton. Used from both pim_ui dialogs and
++ * pim_core (pimEntitlement.cxx, pimSilent.cxx).
++ *
++ * Covers only 4 of the 5 location types pimShortcutLoop supports (Start
++ * Menu, Programs Menu, Desktop, Quick Launch -- no Loadpoint).
++ *
++ * CONFIRMED: AreChangesPending() can only detect a CHANGED shortcut (one
++ * whose id exists in both compared instances) -- it cannot detect a
++ * shortcut being added or removed entirely between the two, since its loop
++ * only iterates this instance's own id list and skips ids not found in the
++ * other. See docs/classes/pimShortcutMgr.md Risk Analysis for the confirmed
++ * real-world consequence in pimEntitlement.cxx's update/reconfigure logic.
++ *
++ * CONFIRMED: GetShortcutDesktopState() is not a per-id query despite its
++ * name/signature parity with the 4 location setters -- it returns the
++ * create state of whichever shortcut happens to declare a DESKTOP child
++ * first in document order.
++ */
+ class pimShortcutMgr
+ {
+ private:
+ 	pimXmlFile *xml;
+ 
++	/**
++	 * @param id The shortcut's id attribute value.
++	 * @return The matching <SHORTCUT> node, or NULL if not found.
++	 */
+ 	DOMNode *FindShortcutNode(const char *id);
++
++	/**
++	 * Sets create="Y"/"N" on the location child named by Match under the
++	 * shortcut named by id, and marks the document content changed.
++	 * @param id The shortcut's id attribute value.
++	 * @param Match The location child element's tag name.
++	 * @param install New create state.
++	 * @return true if the shortcut and location child were found and updated.
++	 */
+ 	bool SetShortcutState(const char *id, const XMLCh [], bool install);
++
++	/**
++	 * Finds every shortcut id that has a child element named Match,
++	 * regardless of that child's own create state.
++	 * @param out Receives the matching shortcut ids.
++	 * @param Match The location child element's tag name to look for.
++	 * @return true if at least one match was found.
++	 */
+ 	bool GetMatchingShortcutIDs(StringXArray& out, const XMLCh Match[]);
++
++	/**
++	 * Reads the create attribute of a specific shortcut's location child.
++	 * @param id The shortcut's id attribute value.
++	 * @param Match The location child element's tag name.
++	 * @param value Receives the create attribute's value.
++	 * @return true if the shortcut and location child were found.
++	 */
+ 	bool GetShortcutState(const char* id, const XMLCh Match[], btkString& value);
+ 
+ public:
++	/**
++	 * Constructs a pimShortcutMgr wrapping ptr. Does not take ownership --
++	 * the destructor does not delete ptr.
++	 * @param ptr The product XML document to wrap.
++	 */
+ 	pimShortcutMgr(pimXmlFile *ptr);
+ 	~pimShortcutMgr();
+ 
+-	bool GetShortcutInfoByID(const char *id, 
++	/**
++	 * Resolves a shortcut's label, linked package, and which of the 4
++	 * supported location types (start_menu/programsmenu/desktop/
++	 * quicklaunch) are currently create="Y". Does not report a Loadpoint
++	 * state -- see class-level doc.
++	 * @param id The shortcut's id attribute value.
++	 * @param Label Receives the shortcut's <NAME> child text.
++	 * @param assoc_package Receives the linked package name, if any.
++	 * @param start_menu Receives the Start Menu create state.
++	 * @param programsmenu Receives the Programs Menu create state.
++	 * @param desktop Receives the Desktop create state.
++	 * @param quicklaunch Receives the Quick Launch create state.
++	 * @return true if the shortcut was found.
++	 */
++	bool GetShortcutInfoByID(const char *id,
+ 		btkString &Label, btkString &assoc_package,
+-		bool &start_menu, bool &programsmenu, 
++		bool &start_menu, bool &programsmenu,
+ 		bool &desktop, bool &quicklaunch);
+ 
++	/**
++	 * Scans every <SHORTCUT> node; returns false the instant any node has
++	 * showenvironment="N" (a single opt-out suppresses the prompt for the
++	 * whole document), true only if the whole document is scanned without
++	 * finding one.
++	 * @return Whether the environment-choice prompt should be shown.
++	 */
+ 	bool ShowEnvironmentChoice();
++
++	/**
++	 * Sets the Start Menu create state for a specific shortcut.
++	 * @param id The shortcut's id attribute value.
++	 * @param install New create state.
++	 * @return true if the shortcut was found and updated.
++	 */
+ 	bool SetShortcutStartMenuState(const char *id, bool install);
++
++	/**
++	 * Sets the Programs Menu create state for a specific shortcut.
++	 * @param id The shortcut's id attribute value.
++	 * @param install New create state.
++	 * @return true if the shortcut was found and updated.
++	 */
+ 	bool SetShortcutProgramsMenuState(const char *id, bool install);
++
++	/**
++	 * Sets the Desktop create state for a specific shortcut.
++	 * @param id The shortcut's id attribute value.
++	 * @param install New create state.
++	 * @return true if the shortcut was found and updated.
++	 */
+ 	bool SetShortcutDesktopState(const char *id, bool install);
++
++	/**
++	 * Sets the Quick Launch create state for a specific shortcut.
++	 * @param id The shortcut's id attribute value.
++	 * @param install New create state.
++	 * @return true if the shortcut was found and updated.
++	 */
+ 	bool SetShortcutQuicklaunchState(const char *id, bool install);
+ 
++	/**
++	 * Sets the Programs Menu subfolder name for a specific shortcut. Does
++	 * NOT mark the document content changed (confirmed asymmetry with the
++	 * 4 Set*State() methods above -- see docs/classes/pimShortcutMgr.md).
++	 * @param id The shortcut's id attribute value.
++	 * @param value New subfolder name.
++	 * @return true if the shortcut was found and updated.
++	 */
+ 	bool SetShortcutProgramMenu(const char *id, const char *value);
++
++	/**
++	 * Reads the Programs Menu subfolder name for a specific shortcut.
++	 * @param id The shortcut's id attribute value.
++	 * @param value Receives the subfolder name.
++	 * @return true if the shortcut was found.
++	 */
+ 	bool GetShortcutProgramMenu(const char *id, btkString &value);
+ 
++	/**
++	 * Sets the start-in directory for a specific shortcut. Does NOT mark
++	 * the document content changed (see SetShortcutProgramMenu()'s doc).
++	 * @param id The shortcut's id attribute value.
++	 * @param value New start-in directory.
++	 * @return true if the shortcut was found and updated.
++	 */
+ 	bool SetShortcutStartDir(const char *id, const char *value);
++
++	/**
++	 * Reads the start-in directory for a specific shortcut.
++	 * @param id The shortcut's id attribute value.
++	 * @param value Receives the start-in directory.
++	 * @return true if the shortcut was found.
++	 */
+ 	bool GetShortcutStartDir(const char *id, btkString &value);
+ 
++	/**
++	 * @param out Receives every <SHORTCUT> node's id attribute, in document order.
++	 * @return true if at least one shortcut was found.
++	 */
+ 	bool GetAllShortcutIDs(StringXArray &);
+ 
++	/**
++	 * Sets allusers="Y"/"N" on every <SHORTCUT> node that already has an
++	 * allusers attribute (a document-wide setting mirrored across every
++	 * node, not a per-shortcut one). Does NOT mark the document content
++	 * changed (see SetShortcutProgramMenu()'s doc).
++	 * @param all_users New environment choice.
++	 * @return true if at least one node was updated.
++	 */
+ 	bool SetEnvironmentChoice(bool all_users);
++
++	/**
++	 * Reads allusers from the first <SHORTCUT> node in document order that
++	 * has one, then stops.
++	 * @param all_users Receives the environment choice.
++	 * @return true if any node had an allusers attribute.
++	 */
+ 	bool GetEnvironmentChoice(bool &all_users);
+ 
++	/**
++	 * Compares this instance's shortcuts against cmp_to's. CONFIRMED: only
++	 * detects a changed shortcut (one whose id exists in both); cannot
++	 * detect a shortcut added or removed entirely between the two -- see
++	 * class-level doc and docs/classes/pimShortcutMgr.md Risk Analysis.
++	 * @param cmp_to The instance to compare against.
++	 * @return true if any shared-id shortcut's label/package/location states differ.
++	 */
+ 	bool AreChangesPending(pimShortcutMgr &cmp_to);
+ 
++	/**
++	 * NOT a per-id query despite the signature parity with
++	 * SetShortcutDesktopState() -- returns the create state of whichever
++	 * shortcut happens to declare a DESKTOP child first in document order.
++	 * See class-level doc.
++	 * @param value Receives the first matching shortcut's Desktop create state.
++	 * @return true if any shortcut with a DESKTOP child was found.
++	 */
+ 	bool GetShortcutDesktopState(btkString& value);
+ 
+ 

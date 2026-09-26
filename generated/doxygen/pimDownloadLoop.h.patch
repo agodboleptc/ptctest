@@ -1,0 +1,218 @@
+--- a/pim_core/includes/pimDownloadLoop.h
++++ b/pim_core/includes/pimDownloadLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -18,6 +18,43 @@
+ 
+ class pimDownloadData;
+ 
++/**
++ * Install-step (pimLoop subclass) that downloads content (external media,
++ * MSI, SFX, and CD-section files) referenced by a product's cache/download
++ * XML into a local cache directory, tracking aggregate progress by size.
++ *
++ * Responsibilities:
++ * - Process download candidates in a fixed category order: EXTERNAL_MEDIA,
++ *   then MSI, then SFX, then CDSECTION (see OnExecute()).
++ * - Compute aggregate DownloadSize/DownloadUnits up front (CalculateDownloadSize())
++ *   so percent-complete can be reported by bytes when sizes are known, or by
++ *   file count otherwise.
++ * - Fetch each file (DownloadOne()) and verify it via TestDigitialSignature().
++ *   NOTE (confirmed): TestDigitialSignature() calls pimIsDigitiallySignedByPTC()
++ *   but unconditionally returns true regardless of the result -- the
++ *   signature check is a functional no-op in this codebase. Its
++ *   failure-path logging is additionally gated behind the undefined macro
++ *   ERROR_ON_UNSIGNED (never #define'd anywhere in this archive), the same
++ *   dead-code pattern seen with ROLLBACK_CANCELLED_INSTALL elsewhere.
++ * - Report progress/time-remaining via GetStatus().
++ *
++ * Structural note: this class overrides Execute(const btkFSEntry&) directly
++ * (rather than using pimLoop's parameterless Execute()) to also set CacheDir
++ * under Mutex before starting the thread; this override does NOT reset
++ * Errors/Warnings the way the base pimLoop::Execute() does.
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - pimEntitlement (SetEntitlement(); used to resolve category-specific
++ *   download sources).
++ * - pimIsDigitiallySignedByPTC (signature check whose result is currently
++ *   discarded; see above).
++ *
++ * Ownership: unlike the 7 singleton-owned Loop types, this class is created
++ * directly by its caller (see docs/classes/pimDownloadLoop.md for the
++ * traced call site) rather than through one of the pimXxx wrapper
++ * singletons documented elsewhere in this codebase.
++ */
+ class pimDownloadLoop : public pimLoop
+ {
+ private:
+@@ -38,48 +75,141 @@
+ 	// size of files or units to download
+ 	double     DownloadSize;
+ 	double     RemainingDownloadSize;
+-	
++
+ 	pimEntitlement *ePtr;
+ 	pimDownloadData *data_in_progress;
+ 
+ protected:
+-	bool GetNextExternalMedia(DOMNodeList *next_cache_section_nl, 
++	/**
++	 * Reads the next EXTERNAL_MEDIA download candidate at index from the
++	 * given node list.
++	 * @param next_cache_section_nl Node list of candidate elements.
++	 * @param index Position within the node list.
++	 * @param WhereFrom Receives the download source location.
++	 * @param WhereTo Receives the local destination path.
++	 * @param _DownloadSize Receives the candidate's declared size.
++	 * @return true if a valid candidate was found at index.
++	 */
++	bool GetNextExternalMedia(DOMNodeList *next_cache_section_nl,
+ 		int index, btkString &WhereFrom,
+ 		btkString &WhereTo, double &_DownloadSize);
+ 
+-	bool GetNextMSI(DOMNodeList *next_cache_section_nl, 
++	/**
++	 * Reads the next MSI download candidate at index from the given node
++	 * list.
++	 * @param next_cache_section_nl Node list of candidate elements.
++	 * @param index Position within the node list.
++	 * @param WhereFrom Receives the download source location.
++	 * @param WhereTo Receives the local destination path.
++	 * @param _DownloadSize Receives the candidate's declared size.
++	 * @return true if a valid candidate was found at index.
++	 */
++	bool GetNextMSI(DOMNodeList *next_cache_section_nl,
+ 		int index, btkString &WhereFrom,
+ 		btkString &WhereTo, double &_DownloadSize);
+ 
+-	bool GetNextSFX(DOMNodeList *next_cache_section_nl, 
+-		int index, btkString &WhereFrom, 
++	/**
++	 * Reads the next SFX download candidate at index from the given node
++	 * list.
++	 * @param next_cache_section_nl Node list of candidate elements.
++	 * @param index Position within the node list.
++	 * @param WhereFrom Receives the download source location.
++	 * @param WhereTo Receives the local destination path.
++	 * @param _DownloadSize Receives the candidate's declared size.
++	 * @return true if a valid candidate was found at index.
++	 */
++	bool GetNextSFX(DOMNodeList *next_cache_section_nl,
++		int index, btkString &WhereFrom,
+ 		btkString &WhereTo, double &_DownloadSize);
+ 
+-	bool GetNextCDSection(DOMNodeList *next_cache_section_nl, 
+-		int index, btkString &WhereFrom, 
++	/**
++	 * Reads the next CDSECTION download candidate at index from the given
++	 * node list.
++	 * @param next_cache_section_nl Node list of candidate elements.
++	 * @param index Position within the node list.
++	 * @param WhereFrom Receives the download source location.
++	 * @param WhereTo Receives the local destination path.
++	 * @param _DownloadSize Receives the candidate's declared size.
++	 * @return true if a valid candidate was found at index.
++	 */
++	bool GetNextCDSection(DOMNodeList *next_cache_section_nl,
++		int index, btkString &WhereFrom,
+ 		btkString &WhereTo, double &_DownloadSize);
+-	
++
+ 	// if we have download size we will use that for progress estimates
+ 	// otherwise we will use number of files
++	/**
++	 * Sums declared sizes across all 4 categories into DownloadSize (falling
++	 * back to a per-file unit count in DownloadUnits when sizes are
++	 * unavailable), initializing the Remaining* counters for GetStatus().
++	 * @return void
++	 */
+ 	void CalculateDownloadSize();
+ 
++	/**
++	 * Downloads a single file from WhereFrom to WhereTo, updating Spent/
++	 * StartInterval and the Remaining* counters used by GetStatus().
++	 * @param WhereFrom Source location (URL or media path).
++	 * @param WhereTo Local destination path.
++	 * @param _DownloadSize Declared size of this file, for progress accounting.
++	 * @return 0 on success; nonzero on failure (exact code semantics: see .cxx).
++	 */
+ 	int DownloadOne(const char *WhereFrom, const char *WhereTo, const double _DownloadSize);
+ 
++	/**
++	 * Calls pimIsDigitiallySignedByPTC() on the downloaded file but, in this
++	 * codebase's traced configuration, UNCONDITIONALLY returns true --
++	 * callers cannot currently be blocked by a failed signature check
++	 * through this path (see class-level doc).
++	 * @param the downloaded file to check.
++	 * @return true (always, in the traced configuration).
++	 */
+ 	bool TestDigitialSignature(btkFSEntry &); // return false if we block use of the file
+-	 
++
++	/**
++	 * Thread entry point; iterates the 4 download categories in order
++	 * (EXTERNAL_MEDIA, MSI, SFX, CDSECTION), calling the matching GetNext*()
++	 * and DownloadOne() for each candidate.
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * Standard thread teardown.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ public:
++	/**
++	 * Constructs a pimDownloadLoop bound to the given XML content, zeroing
++	 * the unit/size counters and clearing the entitlement pointer.
++	 * @param DownloadXMLContent The product/entitlement XML describing what to download.
++	 */
+ 	pimDownloadLoop(pimXmlFile *DownloadXMLContent) : pimLoop(DownloadXMLContent)
+ 	{
+ 		DownloadUnits = RemainingDownloadUnits = 0.0;
+ 		DownloadSize = RemainingDownloadSize = 0.0;
+ 		ePtr = NULL;
+ 	}
++
++	/**
++	 * Associates this Loop with the entitlement whose downloads it will
++	 * process.
++	 * @param E The owning entitlement.
++	 * @return void
++	 */
+ 	void SetEntitlement(pimEntitlement &E)
+ 	{
+ 		ePtr = &(E);
+ 	}
++
++	/**
++	 * Overrides pimLoop::Execute() to also record the destination cache
++	 * directory before starting the thread. Unlike the base class version,
++	 * this override does NOT reset Errors/Warnings.
++	 * @param Where Local cache directory downloads will be written into.
++	 * @return void
++	 */
+ 	void Execute(const btkFSEntry &Where)
+ 	{
+ 		Mutex.Lock();
+@@ -91,6 +221,13 @@
+ 		thrThread::Execute(thrAttached);
+ 	}
+ 
++	/**
++	 * Reports aggregate download progress computed from the Remaining*
++	 * counters and elapsed time.
++	 * @param PercentComplete Receives the overall percent-complete estimate.
++	 * @param TimeRemaining Receives the estimated remaining time.
++	 * @return Implementation-defined status code; see .cxx.
++	 */
+ 	int GetStatus(int &PercentComplete, btkTimeval &TimeRemaining);
+ };
+ 

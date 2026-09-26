@@ -1,0 +1,62 @@
+# Runtime state model for pimEntitlement. Source of truth: docs/06_entitlement_framework.md,
+# docs/04_installation_flow.md.
+
+entitlement_lifecycle_states:
+  note: "the pimEntitlement OBJECT is not destroyed at Done — persists in pimSessionInfo's arrays for the session's life"
+  states:
+    - {state: Constructed, trigger: "pimSessionInfo::AddEntitlement()"}
+    - {state: Initialized, trigger: "Init(xmlFile) / Init(xml, urls, mediaId)"}
+    - {state: SelectionPending, trigger: "registered in EntitlementArray; SetInstallMe/SetReconfigureMe set"}
+    - {state: Running, trigger: "StartOrRestartInstall() / Reconfigure() / Uninstall() spawns thread"}
+    - {state: WaitingOnPrerequisite, trigger: "HasPrerequisite() && !HasPrerequisitesInstallSucceeded()", exit: "external caller must re-invoke StartOrRestartInstall once prerequisite done"}
+    - {state: Reconfiguring, trigger: in_reconfigure}
+    - {state: Updating, trigger: "UpdateOfProduct != NULL", detail: "falls through into Installing after upgrade precleanup"}
+    - {state: Installing, trigger: "fresh install, no update"}
+    - {state: Cancelling, trigger: "IsCancelFlagSet() observed mid-pipeline"}
+    - {state: RollingBack, trigger: "do_rollback OR do_install_rollback", caveat: "do_install_rollback path requires ROLLBACK_CANCELLED_INSTALL macro, NOT defined in this archive"}
+    - {state: Done, trigger: "pipeline completed (any path)"}
+
+in_memory_progress_channel:
+  fields: [total_pct_done, execute_status_string]
+  guard: PctMutex
+  accessors: [GetProgress, GetInstallStep]
+  clamp: "total_pct_done > 100 reported as 99"
+  special_case: "msiexec_return == '3010' forces GetInstallStep() to report pending, even if execute_status_string says otherwise"
+
+persistent_status_channel:
+  xml_property: "ENTITLEMENT_STATUS_STRING (= status_message)"
+  saved_via: "xmlPtr->DoSave() after nearly every pipeline stage"
+  survives_process_restart: true
+  message_catalog:
+    - {id: pimInstallStateInitialize, when: "after Add/Remove Programs entry generated, before main pipeline"}
+    - {id: pimInstallStateDownloading, when: "network/web-download-driven install (exact trigger not individually re-traced)"}
+    - {id: pimInstallStateInstalling, when: "during main pipeline (exact trigger not individually re-traced)"}
+    - {id: pimInstallStateCancelled, when: "any IsCancelFlagSet() trip point"}
+    - {id: pimUIInstallStatusPending, when: "default/fallback in GetInstallStep(); also while ApplyRegistryChanges waits on the pimRegEdit singleton"}
+    - {id: pimUIInstallStatusPendingPrerequisite, when: "HasPrerequisitesInstallSucceeded wait loop still polling"}
+    - {id: pimUIInstallStatusInstall, when: "main copy step begins"}
+    - {id: pimUIInstallStatusDownload, when: "download-related (not individually re-traced)"}
+    - {id: pimUIInstallStatusDownloadStatus, when: "download-related (not individually re-traced)"}
+    - {id: pimUIInstallStatusErrorMsi, when: "hard prerequisite-check failure in HasPrerequisitesInstallSucceeded (name is MSI-specific but reused generically)"}
+    - {id: pimUIInstallStatusIncompleteMsi, when: "MSI-specific incomplete state (not individually re-traced)"}
+    - {id: pimUIInstallStatusComplete, when: "total_pct_done=100, no CA_WARNINGS[_WITH_ERROR]"}
+    - {id: pimUIInstallStatusCompleteWithWarnings, when: "total_pct_done=100, CA_WARNINGS present"}
+    - {id: pimUIInstallStatusCompleteWithErrors, when: "total_pct_done=100, CA_WARNINGS_WITH_ERROR present"}
+
+per_content_item_flags:
+  - {attribute: "installed=Y", scope: "one <CDSECTION> node", set_by: "successful copy/archive install step"}
+  - {attribute: 'install="N"', scope: "one <PACKAGE> node", set_by: "pimMSILoop::OnFailure on any non-success/non-3010/non-1641 MSI exit code", persistence: "persistent until manually reset — causes silent skip on re-run"}
+
+verification_state:
+  dedicated_stage_exists: false
+  closest_analogs:
+    - {mechanism: IsMSISameVersionInstalled, purpose: "skip redundant reinstall"}
+    - {mechanism: "IsPrerequisiteSatisfied(true) re-check", purpose: "catches a prerequisite that finished without actually satisfying its check"}
+  gap: "no equivalent re-verification found for an entitlement's OWN completion state"
+
+failure_state_channels:
+  doc: docs/10_error_handling.md
+  channels:
+    - {channel: "pimLoop::Errors/Warnings", scope: per_loop_instance, format: unstructured_text}
+    - {channel: "process-wide error stack (pimHitError/pimGetLastError)", scope: process_wide, format: integer_code_stack}
+    - {channel: "CA_WARNINGS/CA_WARNINGS_WITH_ERROR XML properties", scope: per_entitlement, effect: "escalates final status message without any stage itself returning false"}

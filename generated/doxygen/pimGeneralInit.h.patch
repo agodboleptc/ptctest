@@ -1,0 +1,56 @@
+--- a/pim/includes/pimGeneralInit.h
++++ b/pim/includes/pimGeneralInit.h
+@@ -57,6 +57,15 @@
+ PIM_PRODUCT_MODE pimGetProductMode();
+ 
+ bool pimGetUpgradeFlag();
++/**
++ * Top-level pim-module command-line parser, called once per process from
++ * every pimTop.cxx Run entry point. Only the -APPLICATIONS/-XML/-XMLALL/-FLEX
++ * handling (pimGeneralInit.cxx:214-262) is traced in depth in this pass --
++ * see docs/classes/pimGetApplicationsList.md. Those 3 flags populate the
++ * shared applications_list static in 2 INCOMPATIBLE formats (bare tags vs.
++ * full filesystem paths) -- see that doc's Risk Analysis for the confirmed
++ * consequences on pimGetApplicationsList()'s consumers.
++ */
+ int pimCommandLineArgs(int argc, const char *argv[]);
+ int pimGeneralInitThreadingOnly();
+ int pimGeneralInit();
+@@ -67,7 +76,18 @@
+ bool pimGetLicenseSource(btkString &out);
+ bool pimGetLicensePreference(btkString &str);
+ bool pimGetLicenseFeatureSet(btkString &str);
++/** Appends one filesystem PATH (btkFSEntry) to the shared applications_list. Confirmed called unconditionally for creobase.xml/qualityagent.xml by AddMandatoryAppsForSilentInstall() (pim_src/pimTop.cxx:1282-1316) on every silent install. See docs/classes/pimGetApplicationsList.md. */
+ void pimAddApplicationsToList(btkFSEntry &app);
++/**
++ * Copies the shared applications_list into `out`; returns true iff non-empty.
++ * CONFIRMED: applications_list's content format depends on which of
++ * -APPLICATIONS (bare tags) / -XML / -XMLALL (full paths) populated it, and
++ * is never tagged with which. 2 of 3 confirmed consumers filter via exact
++ * match against a bare tag/tail and can never match a path-format entry --
++ * see docs/classes/pimGetApplicationsList.md Risk Analysis, including a
++ * confirmed HIGH-SEVERITY bug in InstallPreReqSilent() (pim_src/pimTop.cxx:904-966)
++ * which uses this list's size, not its content, to bound an unrelated loop.
++ */
+ bool pimGetApplicationsList(StringXArray &out);
+ bool pimGetTranslateSpaceChar(btkString &out);
+ bool pimShouldWeInitLanguageID(cStringT in);
+@@ -76,6 +96,18 @@
+ void pimSetTrialMode();
+ bool pimRunInSchoolMode();
+ void pimSetSchoolMode();
++/**
++ * Substring search (Pos(), not exact match) over the shared
++ * applications_list -- the one confirmed consumer robust to that list's
++ * heterogeneous bare-tag-vs-full-path content. CONFIRMED STRUCTURAL RISK
++ * in the opposite direction, though not demonstrated with any real tag
++ * used in this archive today: a substring match can false-positive
++ * whenever one product's filename happens to be a literal substring of
++ * another entry already in applications_list (e.g. a hypothetical
++ * "newcreobase.xml" entry would make a check for "creobase.xml" return
++ * true even if "creobase.xml" itself was never requested). See
++ * docs/classes/pimGetApplicationsList.md Risk Analysis.
++ */
+ bool IsApplicationInInstallList(const btkString &application);
+ bool pimRunInSilentMode(int &progress_ui_enabled);
+ void pimSetSilentMode();

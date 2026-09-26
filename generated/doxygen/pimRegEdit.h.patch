@@ -1,0 +1,128 @@
+--- a/pim_core/includes/pimRegEdit.h
++++ b/pim_core/includes/pimRegEdit.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -12,6 +12,30 @@
+ #include <threadlibcxx.h>
+ #include <pimRegEditLoop.h>
+ 
++/**
++ * Process-wide singleton "owner" wrapper around pimRegEditLoop, the install
++ * step that applies/rolls back Windows registry changes declared in product
++ * XML. One of 7 near-identical Loop-owner wrapper singletons in pim_core.
++ *
++ * Locking contract: TryLock()-gated on an internal mutex, held for the full
++ * duration of the operation -- same pattern as pimCopier/pimShortcuts/
++ * pimServices/pimDownloader.
++ *
++ * CONFIRMED COMMENT/BEHAVIOR MISMATCH: Create()/Uninstall() below are
++ * commented as "these WAIT until they are able to start ... and then they
++ * return immediately," but the actual implementation is a non-blocking
++ * TryLock() that returns false immediately if busy -- identical in shape to
++ * every other wrapper's TryLock-gated methods. The confirmed caller
++ * (pimEntitlement::ApplyRegistryChanges()) explicitly busy-polls with a
++ * sleep on a false return, which would be unnecessary if this method
++ * actually blocked. Trust the implementation and the call-site usage, not
++ * this comment.
++ *
++ * Confirmed gap (shared with pimShortcuts/pimServices/pimDownloader):
++ * Cancel() only sets a flag; the owned pimRegEditLoop is not stopped by it.
++ *
++ * Sole caller in this codebase: pimEntitlement.
++ */
+ class pimRegEdit
+ {
+ private:
+@@ -30,11 +54,21 @@
+ 	btkString host; // reserved for future use
+ 
+ public:
++	/** @return The singleton instance, constructing it on first call. */
+ 	static pimRegEdit& GetInstance();
+ 
+ protected:
+ 	pimRegEdit();
+ 	~pimRegEdit(){}
++
++	/**
++	 * Shared implementation behind Create()/Uninstall(). Constructs a
++	 * pimRegEditLoop, sets its rollback flag if uninstalling, and Execute()s
++	 * it asynchronously under xmlMutex.TryLock(). No path/property resolution
++	 * performed here -- pimRegEditLoop reads directly from the XML it is handed.
++	 * @param uninstall Configures the Loop to roll back registry changes.
++	 * @return true if the lock was acquired and the operation started; false if busy.
++	 */
+ 	int Create_low(pimXmlFile *, bool uninstall = false);
+ private:
+ 	//pimRegEdit(const pimRegEdit&);
+@@ -50,29 +84,62 @@
+ 		PauseFlagSet,
+ 		Error
+ 	};
+-	
++
+ 	// these WAIT until they are able to start a download
+ 	// and then they return immediately.
+-	// 
++	//
++	/**
++	 * Starts a registry-change operation. Despite this method's own comment,
++	 * this is NON-BLOCKING (TryLock-based) -- see class-level doc. Delegates
++	 * to Create_low(xmlPtr, false).
++	 * @return 1 if started; 0 if another operation is in progress; negative on error.
++	 */
+ 	int Create(pimXmlFile *);
++
++	/**
++	 * Starts a registry-rollback operation. Non-blocking (see class-level
++	 * doc); delegates to Create_low(xmlPtr, true).
++	 * @return 1 if started; 0 if another operation is in progress; negative on error.
++	 */
+ 	int Uninstall(pimXmlFile *);
+ 
+ 	// After Download() returns call Status
+ 	// until IDLE state.
++	/**
++	 * Polls the operation's progress. NOTE: percent_done is never actually
++	 * written by this implementation -- treat it as unreliable. On first
++	 * observing the operation is done, deletes the owned pimRegEditLoop and
++	 * releases the lock.
++	 * @param percent_done Declared as a progress output but not populated.
++	 * @return Current RegEditStatus.
++	 */
+ 	RegEditStatus Status(int &percent_done);
+ 
+ 	// Put into a hold after the current download file
+ 	// completes
++	/** Sets a caller-facing pause_flag reported by Status(); does not itself pause the operation. */
+ 	void Pause();
+ 
+ 	// Resume Pause
++	/** Clears pause_flag. */
+ 	void Resume();
+ 
+-	// Cancel - set cancel flag to stop after current download file 
++	// Cancel - set cancel flag to stop after current download file
+ 	// and release/reset all flags so another thread could start
++	/**
++	 * Sets cancel_flag only. Does NOT call anything on the owned
++	 * pimRegEditLoop -- the operation keeps running until it finishes
++	 * naturally or Kill() is called.
++	 * @return void
++	 */
+ 	void Cancel();
+ 
+ 	// Release/reset all flags killing anything in progress
++	/**
++	 * If an operation is in progress, kills the owned pimRegEditLoop, deletes
++	 * it, and releases the lock.
++	 * @return void
++	 */
+ 	void Kill();
+ 
+ };

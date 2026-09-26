@@ -1,0 +1,1188 @@
+--- a/pim_core/includes/pimSilent.h
++++ b/pim_core/includes/pimSilent.h
+@@ -11,14 +11,1185 @@
+ #include <pimCore.h>
+ #include <pimEntitlement.h>
+ 
++/**
++ * Exact-tag-match test between 2 product XML files (loaded as throwaway
++ * stack pimEntitlements, tried via Init(A,NULL) then
++ * Init(A,"EXTERNAL_INSTALLER")). Confirmed called only from within
++ * pimSilent.cxx, by pimSilentTestXmlIsUseable() and pimIsVersionMatch().
++ *
++ * CONFIRMED STRUCTURAL LIMITATION: no cross-schema fallback exists for B.
++ * Whichever root schema (NULL i.e. <PRODUCT>, or "EXTERNAL_INSTALLER")
++ * succeeds for A is the ONLY one ever tried for B in that call -- if
++ * Eb.Init() fails under that schema, the function returns false without
++ * ever retrying B under the other schema. A mixed-schema A/B pair (one
++ * <PRODUCT>-rooted, one <EXTERNAL_INSTALLER>-rooted) is confirmed to always
++ * report "no match" even with identical <TAG> values. Shared identically by
++ * pimIsVersionMatch() below, which duplicates this exact control-flow
++ * shape. Not confirmed reachable with any real XML pair in this archive.
++ *
++ * REACHABILITY, more precisely characterized in a further dedicated pass on
++ * this specific bug: pimEntitlement::Init() (pimEntitlement.cxx:806-833) is
++ * a purely literal-root-tag test -- Init(x,NULL) requires exactly <PRODUCT>,
++ * Init(x,"EXTERNAL_INSTALLER") requires exactly <EXTERNAL_INSTALLER>. This
++ * codebase's OWN other 2 product-XML resolution call sites do NOT assume a
++ * fixed schema for a single file: pimEntitlement.cxx:634-635 (a product's
++ * own .p.xml) tries Init(file,NULL) || Init(file,"EXTERNAL_INSTALLER") ||
++ * Init(file,"HIDDEN_PRODUCT") in sequence, and pimEntitlement.cxx:967-968 (a
++ * <PREREQUISITE> reference) tries Init(x) || Init(x,"EXTERNAL_INSTALLER").
++ * Both confirm, elsewhere in this exact codebase, that a product's root
++ * schema is treated as unpredictable and deliberately checked for --
++ * pimIsProductXmlMatch()/pimIsVersionMatch() are the only 2 functions here
++ * that instead assume A and B share whichever single schema matched A
++ * first. Direct, confirmed evidence the assumption is unsafe by this
++ * codebase's own design, even with no sample mixed-schema XML pair on hand.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass): this function's only caller
++ * is pimSilentTestXmlIsUseable() (pimSilent.cxx:54), whose only caller is
++ * pimSilentInstallFromXML()'s per-file loop (pimTop.cxx:1532), which simply
++ * skips (no abort, no distinct error) any product whose match fails this
++ * way and continues to the next file. pimSilentInstallFromXML()'s own final
++ * return value is pimGetLastError() (pimTop.cxx:2073, pimExit.cxx:16-33),
++ * which resolves to a process-wide static array's LAST appended error, not
++ * a per-file record -- so in a multi-XML batch silent install, a
++ * mixed-schema false-negative on one product can be silently overwritten in
++ * the reported exit code by any later, unrelated error, losing which
++ * specific product failed the match and why.
++ *
++ * See docs/classes/pimSilent.md's Risk Analysis.
++ */
+ bool pimIsProductXmlMatch(const char *, const char *);
++/**
++ * Version/shipcode compatibility test between 2 already-tag-matched product
++ * XML files -- true iff A's version can be satisfied by B (same or newer).
++ * Major/Minor report which half of the comparison succeeded, for the
++ * caller's differentiated error messaging. Confirmed called only from
++ * pimSilentTestXmlIsUseable().
++ *
++ * Shares pimIsProductXmlMatch()'s confirmed no-cross-schema-fallback
++ * limitation for its own Ea/Eb initialization -- see that function's
++ * comment and docs/classes/pimSilent.md's Risk Analysis.
++ *
++ * CONFIRMED, found in a further dedicated pass on the shipcode comparison
++ * specifically: the check is OPTIONAL, not enforced -- it only runs if
++ * BOTH A and B expose a shipcode (pimEntitlement::GetShipcode(),
++ * pimEntitlement.cxx:2066-2090, returns false if the root <PRODUCT> node
++ * has neither appshipcode nor shipcode). pimEntitlement::Init()
++ * (pimEntitlement.cxx:846-870) only requires tag/version -- NOT
++ * shipcode/appshipcode -- so a valid, Init()-succeeding product XML can
++ * legitimately lack both, silently bypassing the gate. Not confirmed
++ * against any specific real product/media XML in this archive (none
++ * exists), but the mechanism is fully confirmed from Init()'s own
++ * attribute requirements.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass): when skipped this way,
++ * this function reaches `return true;` via the EXACT SAME path as an
++ * explicit shipcode match (res==0 or res==-1) -- nothing distinguishes
++ * "the comparison ran and passed" from "the comparison never ran" (no
++ * log, no warning, no property set). pimSilentTestXmlIsUseable()'s own
++ * differentiated-error logic only inspects Major/Minor inside its
++ * `if (!pimIsVersionMatch(...))` branch -- i.e. only on the REJECTED
++ * path -- so it is never consulted when the check was silently skipped;
++ * the caller proceeds straight to pimSilentCanMatchNeeds()/
++ * pimSilentCreateEntitlement() exactly as for an explicitly-verified pair.
++ *
++ * 2 VERIFIED NON-ISSUES, checked while tracing this: (1) Minor is only set
++ * true when shipcodes are EXACTLY EQUAL (res==0), not when B's is
++ * legitimately newer (res==-1, this function's own documented common
++ * case) or when the check is skipped -- but since Major/Minor are read by
++ * the caller only on the REJECTED path, and this asymmetry only occurs on
++ * ACCEPTED paths, it has no effect. (2) pimCompareShipcode()'s own
++ * parameter names (new_ship/old_ship, pimUtil.cxx:584) don't reflect an
++ * enforced argument-order contract -- cross-checked against its only
++ * other call site (pimEntitlement::GetSize(), pimEntitlement.cxx:2109),
++ * confirming it's a generic, symmetric comparator, so this function's
++ * pimCompareShipcode(MOR_A, MOR_B) call is a valid usage, not a
++ * naming-driven bug.
++ *
++ * See docs/classes/pimSilent.md's Risk Analysis.
++ */
+ bool pimIsVersionMatch(const char * A, const char * B, bool &Major, bool &Minor, btkString &, btkString &, btkString &);
++/**
++ * Platform/language/package availability test between 2 already-version-matched
++ * product XML files; logs a specific missing-platform/language/feature message
++ * and returns false on the first unmet request in A.
++ *
++ * CONFIRMED BUG: leaks both internal pimXmlFile objects (A_tmp/B_tmp) whenever
++ * either fails to parse -- every internal early-return correctly deletes both
++ * first, but the outer failure fallthrough does not.
++ *
++ * CONFIRMED (imprecise header comment, but NOT a validation gap -- see
++ * pimSilentCreateEntitlement()'s comment): the package half of this check
++ * silently changes meaning depending on 3 global, process-wide command-line
++ * mode flags -- -allpacks (pimGetAllPacksMode()) makes it check EVERY
++ * package A's XML declares, regardless of A's own install="Y" markings;
++ * -basepack (pimGetBasePackMode()) makes it check ONLY required="Y"
++ * packages, ignoring A's actual install selections entirely; a 3rd
++ * CreoNGCRI-mode variant applies yet another definition. This function's own
++ * header comment ("returns false if any packages marked for install in A
++ * are not known in B") only describes the default, no-special-mode case --
++ * confirmed by direct contrast with its platform/language sibling checks in
++ * this same function, which perform a simple, unconditional install="Y"
++ * lookup with no such dependency. CORRECTED (found in a later, dedicated
++ * pass on pimSilentCreateEntitlement()): this is confirmed to be BY DESIGN,
++ * not a validation gap -- pimSilentCreateEntitlement()'s package-selection
++ * loop calls the identical GetInstallPackageNames() under the same mode
++ * flags on the same A, guaranteed (by call order) to see the same result,
++ * so this function validates exactly what pimSilentCreateEntitlement() will
++ * actually attempt to install.
++ *
++ * REACHABILITY, more precisely characterized in a further dedicated pass on
++ * this specific bug: the 3 mode flags are NOT cleanly mutually exclusive.
++ * -allpacks/-basepack ARE enforced mutually exclusive by the CLI parser
++ * itself (pim/pim_src/pimGeneralInit.cxx:309-320, each else-if branch clears
++ * the other), but -releaselink (sets pimGetCreoNGCRIMode() via
++ * pimSetCreoNGCRIMode(1), pimGeneralInit.cxx:291-293) has NO such
++ * interaction with either -- a real command line can freely combine
++ * -releaselink -basepack. Since GetInstallPackageNames()'s if/else-if chain
++ * checks pimGetBasePackMode() FIRST, pimGetCreoNGCRIMode() SECOND,
++ * combining them makes BasePack silently win for package selection while
++ * CreoNGCRIMode remains fully active for every OTHER purpose elsewhere in
++ * the codebase (10+ independent call sites in pim_ui) -- a confirmed,
++ * reachable interaction via ordinary command-line flags, not hypothetical.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass): whatever this mode-dependent
++ * selection resolves to is not merely a validation-time concern --
++ * pimPackageMgr::SetPackageInstallState() (pimPackageMgr.cxx:250-336) writes
++ * it directly onto the <PACKAGE> node's own install="Y"/"N" attribute on
++ * Eb's shared xmlPtr. pimMSILoop::IsEligibleForInstall()
++ * (pimMSILoop.cxx:937-969) reads that SAME attribute at real
++ * install-execution time -- via pimEntitlement::InstallMSI() (:5293-5330)
++ * constructing a pimMSILoop (already a fully documented pimLoop subclass)
++ * through pimMSICopier::MSIInstall()/MSICopy_low() on this same xmlPtr --
++ * to decide whether a package's MSI feature/CDSECTION is ACTUALLY,
++ * PHYSICALLY INSTALLED. This confirms the mode-dependent logic is the
++ * literal, unbroken, real-world determinant of installed product features,
++ * identical for both this function's validation and
++ * pimSilentCreateEntitlement()'s selection.
++ *
++ * CONFIRMED, found in a further dedicated pass on the platform and
++ * language checks specifically: both are genuinely free of the package
++ * check's mode-dependence (GetInstallPlatformNames()/GetInstallLanguageNames(),
++ * pimPlatformMgr.cxx:253-281/pimLanguageMgr.cxx:147-175, are plain,
++ * unconditional install="Y" checks, no mode flags for either) -- but they
++ * LACK the package check's later-confirmed consistency guarantee.
++ * pimSilentInstallFromXML()'s post-creation code (pim/pim_src/pimTop.cxx:1602-1635,
++ * running AFTER pimSilentCreateEntitlement() and hence after this
++ * validation already ran) re-derives what actually gets selected on Eb
++ * from ENTIRELY DIFFERENT inputs than A's install="Y" markings this check
++ * validates: PLATFORM via pimPlatformMgr::InitPlatformState(NULL)
++ * (pimPlatformMgr.cxx:104-125), which derives the platform from
++ * btkGetPlatform() -- the CURRENT MACHINE's own runtime OS -- with a
++ * 2-level fallback chain (i486_nt/x86e_win64); LANGUAGE via 9 hardcoded
++ * SetLanguageInstallState() calls gated by pimShouldWeInitLanguageID()
++ * (pim/pim_src/pimGeneralInit.cxx:531-539), true whenever that language is
++ * in the -LANG CLI list (pimGeneralInit.cxx:269-273) OR -allpacks is set
++ * (force-selecting all 9). This function never sees the CLI args or the
++ * running machine's platform, so it structurally CANNOT validate what
++ * -lang/-allpacks/auto-detection will actually select against B's real
++ * coverage.
++ *
++ * CORRECTED (found while investigating pimSilentFixupPSF()'s Ea/Eb
++ * reference-vs-copy semantics, which required re-reading
++ * pimSilentCreateEntitlement()'s full body): the "lacks the package
++ * check's consistency guarantee" framing above was INCOMPLETE.
++ * pimSilentCreateEntitlement() (pimSilent.cxx:549-569) DOES mirror A's
++ * declared platform/language onto B first, via the IDENTICAL
++ * GetInstallPlatformNames()/GetInstallLanguageNames() calls this check
++ * uses -- the same consistency pattern already confirmed for package
++ * selection. The corrected gap: this internally-consistent mirroring is
++ * SUBSEQUENTLY UNDONE by a 2nd, independent write -- pimTop.cxx's
++ * post-creation code overwrites/expands the SAME 2 properties afterward
++ * using entirely different, never-validated inputs.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass): both pimTop.cxx call sites
++ * (:1609-1627,1630) discard the return value of
++ * SetLanguageInstallState()/InitPlatformState() -- both fail SILENTLY (no
++ * log, no error) whenever FindLangNode()/FindPlatNode() can't find a
++ * matching node in B. A -lang XX (or -allpacks) request naming a language
++ * B genuinely lacks is silently dropped with zero diagnostic anywhere in
++ * the pipeline; if the auto-detected platform and both fallbacks all fail
++ * to match anything in B, the entitlement silently ends up with NO
++ * platform marked for install at all.
++ *
++ * FIX (a) VERIFIED SUFFICIENT ONLY FOR DIAGNOSABILITY, found in a further
++ * dedicated pass verifying this bug's 2 proposed fixes: checking the
++ * return values above and logging the failure makes the outcome VISIBLE
++ * but changes NOTHING about it. Traced the zero-platform case one level
++ * further: pimPackageMgr::RefreshAFeatureNode()
++ * (pim_core/pim_core_src/pimPackageMgr.cxx:883-980) checks every
++ * <CDSECTION>/<MSI> node's own platform attribute against
++ * platmgr->GetPlatformInfoByName_low(); if not required/install-selected/
++ * installed, or not found in B at all, the feature node is set
++ * install="N" and skipped. If InitPlatformState()'s fallback fails
++ * completely, NO platform is ever marked install="Y", so EVERY
++ * platform-scoped feature in B fails this check identically -- a
++ * near-total, silent install failure logging alone can only report after
++ * the fact, never prevent.
++ *
++ * CORRECTION, found in the same pass: InitPlatformState()'s "2-level
++ * fallback" is more precisely a MUTUALLY EXCLUSIVE, conditionally-chosen
++ * single fallback (pimPlatformMgr.cxx:104-125), not both names tried in
++ * sequence -- x86e_win64/arm64_win64 detected -> try i486_nt only;
++ * anything else -> try x86e_win64 only; no 3rd attempt if that also
++ * fails.
++ *
++ * FIX (b) CONFIRMED ARCHITECTURALLY FEASIBLE for both language and
++ * platform, resolving the original finding's "if feasible" hedge:
++ * pimShouldWeInitLanguageID()/pimGetAllPacksMode() and btkGetPlatform()
++ * (called identically, with no session/object context, from at least 8
++ * other sites, e.g. pimEntitlement.cxx:858,3322,5013) are all global,
++ * parameterless/self-contained accessors -- this function could call
++ * either directly, no signature change needed, exactly as its own
++ * package half already reads pimGetBasePackMode()/pimGetCreoNGCRIMode()/
++ * pimGetAllPacksMode() this same way.
++ *
++ * NEW nuance, found while verifying fix (b)'s completeness: a validating
++ * copy checking only the raw auto-detected platform name -- without
++ * replicating the exact conditional-single-fallback branch just
++ * corrected above -- would produce FALSE-NEGATIVE validation rejections
++ * for A/B pairs InitPlatformState() would actually satisfy today via its
++ * 1 fallback attempt.
++ *
++ * NEW maintenance-hazard, not weighed by the original suggestion:
++ * implementing fix (b) faithfully requires duplicating BOTH the
++ * 9-hardcoded-language gating rule and the platform fallback branch into
++ * this function -- a 2nd, independent copy of logic that already lives,
++ * unchanged, in pimTop.cxx's post-creation code, with nothing keeping the
++ * 2 copies in sync if either is ever edited -- trading today's "no
++ * consistency guarantee" gap for a structurally similar "2 sources of
++ * truth" gap, rather than closing it.
++ *
++ * NEW, unresolved design tradeoff, found in the same pass: unlike the
++ * package check (where a failed validation correctly means "don't create
++ * this entitlement," a genuinely unsatisfiable request), extending
++ * validation to auto-detected platform would mean a machine simply
++ * lacking that platform in B (no CLI override involved) could have an
++ * otherwise fully valid single-product install REJECTED OUTRIGHT, rather
++ * than proceeding with only its platform-scoped pieces silently missing,
++ * as today. This codebase states no explicit policy on which behavior is
++ * intended, so fix (b), unlike fix (a), is confirmed to be a genuine
++ * behavior/policy decision, not a mechanical hardening.
++ *
++ * CONFIRMED BUG, found in a further dedicated pass specifically on this
++ * function's package check reachability: traced A_pkg.GetInstallPackageNames()/
++ * B_pkg.GetAllPackageNames() (:307-308) into pimPackageMgr
++ * (pimPackageMgr.cxx:611-666,550-575). Neither function null-checks
++ * map->getNamedItem()'s result before calling ->getNodeValue() on it --
++ * GetAllPackageNames() for `name` only, GetInstallPackageNames() for
++ * `name` and, depending on the active mode flag, `install`/`required`/
++ * `parent` as well.
++ *
++ * CONFIRMED DISCREPANCY, by direct contrast within the same class:
++ * pimPackageMgr::GetPackageInfoByName() (:113-170), a sibling function in
++ * this same file reading the exact same 4 attributes off the exact same
++ * <PACKAGE> node type, guards every one of them (if (attribRequired) {...},
++ * if (attribInstall) {...}, if (attribParent) {...}, if (attribLabel) {...})
++ * before dereferencing -- confirmed evidence this class's own author
++ * anticipated these attributes can legitimately be absent, making
++ * GetInstallPackageNames()/GetAllPackageNames()'s unguarded access an
++ * inconsistency, not a deliberate "always present" assumption.
++ *
++ * REACHABILITY, precisely characterized (which attribute crashes depends
++ * on the active CLI mode): `install` is dereferenced unconditionally in
++ * BOTH default mode AND -allpacks mode -- it is the LEFT operand of ||, so
++ * short-circuit evaluation order means it is always evaluated before
++ * pimGetAllPacksMode() is ever consulted, defeating the assumption that
++ * "install everything" mode tolerates a missing install attribute.
++ * `required` is dereferenced unconditionally under -basepack/-releaselink,
++ * for every <PACKAGE> node, not just selected ones. `parent` is
++ * dereferenced additionally under -releaselink when that node's required
++ * isn't "Y". `name` is dereferenced only for a node the active mode has
++ * already decided to select. Since this check runs on BOTH A (a
++ * user-supplied silent-install request XML) and B (the matched media
++ * product definition), and no <PACKAGE>-node authoring/schema-validation
++ * code exists anywhere in this archive to confirm these attributes are
++ * always populated, this is NOT confirmed reachable against a real
++ * product/media XML pair (none exists in this archive), but the crash
++ * mechanism and the internal inconsistency against this class's own
++ * sibling are fully confirmed from source.
++ *
++ * CONFIRMED narrower than the platform/language checks' analogous risk:
++ * pimPlatformMgr::GetInstallPlatformNames()/GetAllPlatformNames() and
++ * pimLanguageMgr's equivalents share the identical unguarded name/install
++ * pattern (2 vulnerable attributes each), but lack this function's extra
++ * -basepack/-releaselink branching -- so the package check specifically
++ * has the WIDEST exposure of the 3 sibling checks (4 vulnerable
++ * attributes vs. 2).
++ *
++ * See docs/classes/pimSilent.md's Risk Analysis.
++ */
+ bool pimSilentCanMatchNeeds(const char * A, const char * B);
++/**
++ * Mirrors Ea's PSF/command set onto Eb (pimCommandMgr): drops Eb's existing
++ * commands, adds each of Ea's wanted commands, then deletes anything left in
++ * Eb that isn't one of Ea's. Handles a name-reused-with-a-different-type
++ * collision via a temporary pDiUmMMY<N> placeholder. Confirmed called only
++ * from pimSilentCreateEntitlement().
++ *
++ * CONFIRMED BUG: the pDiUmMMY<N> placeholder itself can become permanently
++ * stuck in Eb's final command set. It is added specifically to satisfy
++ * pimCommandMgr::CanDeleteCommand()'s documented "cannot delete the last
++ * command of a type" rule (pimCommandMgr.cxx:405-451,454-515) so the real
++ * colliding commands can be removed -- but if none of Ea's final wanted
++ * commands happen to also be of that same license type, the dummy ends up
++ * as the LAST command of that type by the time the final cleanup loop runs,
++ * and DeleteCommand() silently fails the same "last of a type" check on it
++ * (neither of this function's 2 relevant DeleteCommand() calls checks the
++ * return value). This is a plausible, non-degenerate scenario -- e.g. a
++ * single command's license type changing between product versions with no
++ * other command sharing the old type -- not merely a contrived edge case.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (found in a further dedicated pass on
++ * this specific bug): a stuck dummy is not merely cosmetic.
++ * pimEntitlement::InstallScripts() (pimEntitlement.cxx:5627-5631)
++ * constructs a pimScriptLoop directly on this SAME pimXmlFile* document
++ * (Eb's xmlPtr) at real install-execution time. pimScriptLoop::OnInstall()
++ * (pimScriptLoop.cxx:71-127) calls GetAllCommandNames(arr) and, for any
++ * entitlement lacking a SimulateLicenseTypes XML property, reads arr[0]'s
++ * license identifiers UNCONDITIONALLY (no type-based selection, :111) to
++ * populate [LM_LICENSE_FILE] for that entitlement's generated install
++ * scripts. If the stuck dummy lands at index 0 of arr, its own
++ * internally-mismatched data (tagged type lictype2, but populated with
++ * Ea's identifiers for the different type lictype) would drive
++ * [LM_LICENSE_FILE] for the ENTIRE entitlement, not just the dummy's own
++ * inert entry. Whether the dummy reliably reaches index 0, and whether it
++ * even appears in arr at all (GetAllCommandNames()'s default
++ * include_feature_less=false filters out any <PSF> node without a
++ * <FEATURE_NAME> child -- not independently confirmed for the dummy's
++ * cloned <PSF_TEMPLATE>), is not confirmed either way in this archive; the
++ * mechanism connecting the 2 functions via the shared XML document is.
++ *
++ * FIX VERIFIED (PARTIALLY), found in a further dedicated pass verifying
++ * the proposed fix -- "either pimSilentFixupPSF() must guarantee no dummy
++ * survives, or pimScriptLoop must select the license command by type/role
++ * rather than array position 0". OPTION 1, "guarantee no dummy survives",
++ * CONFIRMED ALREADY TRUE IN HALF THE CASES, STRUCTURALLY UNACHIEVABLE IN
++ * THE OTHER HALF without a new capability: when some OTHER A_wants entry
++ * independently shares lictype2, that entry's own AppendAddCommand() call
++ * (:397-404) already restores lictype2's live count to >=2 before the
++ * final cleanup loop runs, so DeleteCommand("pDiUmMMY<N>") ALREADY
++ * SUCCEEDS today -- no fix needed there. When no such entry exists,
++ * CanDeleteCommand()'s floor (count > 1, pimCommandMgr.cxx:454-515) has NO
++ * override or bypass anywhere in that class -- confirmed structurally
++ * IMPOSSIBLE to reduce any license type to 0 live commands through the
++ * existing delete-based API, regardless of operation ordering. A complete
++ * fix in this remaining case requires a genuinely NEW pimCommandMgr
++ * capability: an in-place "retype" operation mutating the EXISTING
++ * colliding command's own <LICTYPE> (and its other type-specific
++ * children) directly, reusing AppendAddCommand()'s own template-cloning
++ * machinery (FindPsfTempateNode() + deep-cloning a <PSF_TEMPLATE>'s
++ * children, pimCommandMgr.cxx:310-378) against the node already present
++ * instead of a newly-created one -- never passing through a 0-count
++ * instant, so CanDeleteCommand()'s floor is never even consulted.
++ * Architecturally sound (the building blocks already exist and are
++ * exercised by AppendAddCommand()'s own node-creation branch), but a new
++ * method, not a change to this function's own logic.
++ *
++ * OPTION 2, "select by type/role, not array position 0", CONFIRMED
++ * ARCHITECTURALLY PRECEDENTED, BUT CONCRETELY UNDER-SPECIFIED:
++ * pimScriptLoop::OnInstall() itself, a few lines below the arr[0] lookup,
++ * already performs exactly this kind of role-based selection for a
++ * DIFFERENT purpose -- xmlPtr->FindNodelistAttribMatch(pimPSF, pimid,
++ * "parametric") (pimScriptLoop.cxx:135) -- confirming the mechanism is
++ * not hypothetical, it's a live pattern in the very same function. But no
++ * canonical id (or <LICTYPE>) value representing "the license-bearing
++ * command" for [LM_LICENSE_FILE] purposes is confirmed to exist anywhere
++ * in this archive -- no sample product/media XML or schema documentation
++ * defines one -- so option 2 is feasible in mechanism but not yet
++ * implementable as literally stated.
++ *
++ * FURTHER CONFIRMED, extending the already-flagged include_feature_less
++ * uncertainty above: traced AppendEditCommand()
++ * (pimCommandMgr.cxx:270-308, which AppendAddCommand() delegates to for
++ * Description/Features) and confirmed it only ever UPDATES an existing
++ * <FEATURE_NAME> child's text -- it has no code path to CREATE one if the
++ * cloned <PSF_TEMPLATE> lacked it. So the dummy's presence in arr at all
++ * is fixed entirely by lictype2's own template authoring, never by
++ * anything this function or pimScriptLoop itself does.
++ *
++ * NEW, related design smell, independent of the dummy bug entirely:
++ * arr[0]'s "just take the first command" assumption is confirmed fragile
++ * on its own terms -- this exact function already relies on multiple,
++ * semantically distinct PSF commands coexisting (the id="parametric"
++ * lookup presupposes at least one other role-distinct command can exist),
++ * so even in a perfectly healthy, dummy-free document, nothing in the
++ * schema or code guarantees arr[0] is the intended "primary"
++ * license-bearing command -- document order, not role, is all that
++ * currently decides it.
++ *
++ * CONFIRMED DISCREPANCY: the inline comment describing this collision
++ * handling says it removes "the foobar command" (singular), but the code
++ * calls GetAllCommandNamesByType() and deletes EVERY command sharing that
++ * license type, not just the one colliding name -- any of Eb's other,
++ * non-colliding commands of that type are dropped too unless Ea's wanted
++ * set happens to re-add them.
++ *
++ * REACHABILITY, precisely characterized in a further dedicated pass on this
++ * discrepancy specifically: this function's own opening "Drop" step
++ * (:361-365) already deletes every original command in B before this
++ * collision-handling block runs -- but CanDeleteCommand()'s live "last of a
++ * type" count (pimCommandMgr.cxx:454-515, counts <PSF> nodes by <LICTYPE>
++ * AT CALL TIME) makes that Drop loop deterministically leave EXACTLY 1
++ * surviving command per originally distinct license type (every earlier
++ * same-type deletion in the loop succeeds since >=2 members remain each
++ * time; the final one always fails). So a given lictype2's FIRST collision
++ * can only ever delete that ONE straggler -- matching the comment's
++ * singular framing. The discrepancy only actually manifests when 2+
++ * A_wants entries in the SAME call independently collide against different
++ * B commands that originally shared the SAME lictype2 -- real but narrower
++ * than "any non-colliding command of that type" suggests.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass), an internal interaction
++ * with the stuck-dummy bug above, not an external consumer: since
++ * AppendAddCommand() (:389) runs BEFORE the b_cmd_names delete loop
++ * (:390-391), and b_cmd_names was captured BEFORE that new dummy existed, a
++ * 2nd (or later) collision on the same lictype2 deletes the PREVIOUS
++ * iteration's straggler/dummy while its own brand-new dummy survives --
++ * every one of these in-between deletions succeeds. When N collisions in
++ * one call target the same original lictype2, this "delete entire type"
++ * behavior acts as an UNINTENTIONAL CLEANUP MECHANISM for dummies 1 through
++ * N-1 -- only the LAST dummy created for a shared lictype2 is actually
++ * exposed to the stuck-dummy risk and its traced pimScriptLoop
++ * [LM_LICENSE_FILE] consequence. This NARROWS, without retracting, that
++ * earlier finding: the risk is real, but confirmed to apply to at most 1
++ * dummy per originally-distinct license type per call.
++ *
++ * CONFIRMED, found in a further dedicated pass on this function's Ea/Eb
++ * reference-vs-copy semantics: both parameters are symmetric, non-const
++ * references, but confirmed to have ASYMMETRIC ROLES -- every Ea/A_cmds
++ * call in this function is a read-only accessor (GetCommandInfoByName()/
++ * GetAllCommandNames()), never a mutator, while Eb/B_cmds is the sole
++ * read-write target (DeleteCommand()/AppendAddCommand()). Ea could safely
++ * be declared const pimEntitlement&; its non-const declaration is a minor,
++ * confirmed API-clarity gap, not a functional bug.
++ *
++ * Traced pimSilentCreateEntitlement()'s own construction of Ea/Eb
++ * (pimSilent.cxx:507-521,736): Ea is a genuinely EPHEMERAL,
++ * stack-allocated pimEntitlement -- Init()'d fresh from A's file path and
++ * destroyed (its xmlPtr explicitly deleted, pimEntitlement.cxx:226-234)
++ * the moment pimSilentCreateEntitlement() returns. Eb is NOT a copy at
++ * all -- pimEntitlement* Eb = pimGetSessionInfo()->GetEntitlement(...)
++ * points directly at the real, session-owned, PERSISTENT object
++ * AddEntitlement(B) just created, and pimSilentFixupPSF(Ea, *Eb) mutates
++ * that SAME object by reference -- confirming why every already-documented
++ * downstream consumer (pimScriptLoop, pimShortcutLoop, pimMSILoop, etc.)
++ * genuinely reads the identical object this function wrote to, not a
++ * snapshot.
++ *
++ * REACHABILITY, precisely characterized (a real but confirmed
++ * UNREACHABLE structural hazard): pimEntitlement owns a raw xmlPtr
++ * pointer, explicitly deleted in its destructor, but defines NO custom
++ * copy constructor or assignment operator anywhere in this file -- relying
++ * on the compiler-generated (shallow-copy) defaults. If 2 pimEntitlements
++ * ever shared xmlPtr via a by-value copy, BOTH destructors would delete
++ * it -- a double-free. An exhaustive search confirms the ONLY 3
++ * stack-allocated, value-type pimEntitlement instances anywhere in this
++ * codebase are all in this same file (pimIsProductXmlMatch()'s/
++ * pimIsVersionMatch()'s own Ea/Eb, and pimSilentCreateEntitlement()'s own
++ * Ea) -- every one confirmed used safely, never copy-constructed or
++ * assigned from another pimEntitlement. Every other entitlement in the
++ * codebase is held via dsXArray<pimEntitlement*> (pimSessionInfo.h:96-97)
++ * or a raw pointer, never by value -- making this function's (and its
++ * siblings') reference-parameter choice the correct, load-bearing design
++ * decision that avoids ever triggering this latent hazard.
++ *
++ * VERIFIED NON-ISSUE: although Ea is destroyed immediately after this
++ * call, every value this function copies from it into Eb (desc/
++ * licIdentifiers/features, via GetCommandInfoByName()'s btkString/
++ * StringXArray out-parameters) is a genuine value copy, not a reference
++ * back into Ea's own DOM tree -- Eb's resulting document holds no
++ * dangling reference to Ea after Ea disappears.
++ *
++ * Ea CONST-REFERENCE HARDENING VERIFIED NOT PURELY MECHANICAL, found in a
++ * further dedicated pass specifically verifying the suggestion above
++ * (pim_core/includes/pimEntitlement.h:320, pim_core/includes/pimCommandMgr.h:54-118):
++ *   pimXmlFile* GetXMLPtr() { return xmlPtr; }   // NOT declared const
++ * This function's only direct call on Ea is Ea.GetXMLPtr() (:357) --
++ * everything else routes through A_cmds. Since GetXMLPtr() itself is not
++ * const, changing the parameter to `const pimEntitlement& Ea` as literally
++ * suggested FAILS TO COMPILE. CONFIRMED SAFE PREREQUISITE: const-qualifying
++ * GetXMLPtr() (same non-const pimXmlFile* return type -- ordinary "shallow
++ * const") fixes this with ZERO behavior change anywhere, since
++ * pimCommandMgr's constructor already takes a plain non-const pimXmlFile*
++ * regardless; an exhaustive search confirms ZERO existing
++ * `const pimEntitlement` usage anywhere in this codebase today, so this
++ * would be a pure widening, never a narrowing of any existing call site.
++ *
++ * CONFIRMED SCOPE CEILING: even with both changes applied, the const only
++ * blocks a non-const pimEntitlement-level call directly on Ea (this
++ * function has none left to block, once GetXMLPtr() itself is const).
++ * Read pimCommandMgr.h in full (:54-118): NONE of its public methods are
++ * declared const -- including the exact 3 read-only accessors this
++ * function calls on A_cmds (GetCommandInfoByName()/GetAllCommandNames()/
++ * GetAllCommandNamesByType()). `const pimCommandMgr A_cmds(...)` would
++ * ALSO fail to compile, so there is no way, even in principle, to make
++ * A_cmds itself reject a mutating call (DeleteCommand()/AppendAddCommand())
++ * against Ea's document via the type system -- confirmed by a further
++ * search finding ZERO `const pimXmlFile` usage in any header in this
++ * codebase. The Ea const-reference hardening is confirmed to be a
++ * documentation-only signal at this function's own top-level signature --
++ * accurately reflecting today's already-verified read-only usage, but
++ * structurally incapable of catching the realistic mistake (A_cmds
++ * accidentally mutating Ea's document), since that mistake lives one layer
++ * below what a const Ea parameter can ever reach, and this codebase has no
++ * const-correct API anywhere in that layer to build on.
++ *
++ * CONFIRMED, found in a further dedicated pass specifically on this
++ * function's DeleteCommand() return-value check -- not a new function, a
++ * precise, per-call-site trace of what checking it would actually reveal,
++ * and a genuinely new generalization of the already-documented stuck-dummy
++ * finding. There are exactly 3 DeleteCommand() call sites (:364,391,413).
++ *
++ * SITE 1, the Drop step (:364) -- VERIFIED NON-ISSUE: a false return here
++ * is the loop's own expected, by-design terminal state, already documented
++ * by its own inline comment ("if more than one command exists ... this
++ * would succeed"), and is exactly what makes this step deterministically
++ * leave 1 surviving command per originally-distinct license type. Checking
++ * or logging it would produce noise on every multi-command type, not a
++ * signal.
++ *
++ * SITE 2, collision-handling (:391) -- CONFIRMED, by an exhaustive
++ * counting proof, to ALWAYS SUCCEED, conditionally: AppendAddCommand()
++ * (:389) runs BEFORE this delete loop, adding a dummy of type lictype2
++ * first. Since b_cmd_names was captured (:386) before the dummy existed,
++ * the count of lictype2 members remaining just before deleting the k-th of
++ * n names is always (n-k)+1 (not-yet-deleted originals + the dummy) --
++ * always >1, for every k from 1 to n. Every delete in this loop is
++ * therefore guaranteed to pass CanDeleteCommand(), PROVIDED
++ * AppendAddCommand() actually created the dummy -- itself never checked
++ * (its own return value is discarded at :389 too), and traced to depend on
++ * FindPsfTempateNode(lictype2) finding a matching <PSF_TEMPLATE>
++ * (pimCommandMgr.cxx:923-929) -- not confirmed either way in this archive
++ * (no product/media XML sample exists). If that precondition failed, this
++ * loop's deletes would fall back to the ordinary "last of a type" risk,
++ * AND the subsequent re-add loop (:397-404) would find the original,
++ * wrong-type node still present under the same name (FindPsfNode()
++ * matches by name, not <LICTYPE>) and merely update its license
++ * identifiers/description/features in place via AppendEditCommand()
++ * (pimCommandMgr.cxx:270-308) -- which never touches <LICTYPE> -- leaving
++ * the WRONG license type permanently attached, silently defeating the
++ * entire collision-fixup mechanism. Not confirmed reachable, but the code
++ * path enabling it is fully confirmed from source.
++ *
++ * SITE 3, final cleanup (:413) -- CONFIRMED, generalizing the
++ * already-documented stuck-dummy finding beyond dummies specifically: this
++ * is where checking the return value would matter most. ANY command --
++ * dummy or genuinely original -- that is the SOLE remaining representative
++ * of its license type by this point gets silently, permanently stuck
++ * whenever A_wants contains NO command of that type at all, for exactly
++ * the same "last of a type" reason. A license type surviving the Drop step
++ * as a single, non-colliding straggler (never touched by the
++ * collision-handling block, which only processes names actually present
++ * in A_wants), that A simply does not want ANY command of, cannot be
++ * removed here -- CanDeleteCommand() counts exactly 1 member and refuses.
++ * This confirms pimSilentFixupPSF()'s own stated goal (its file header
++ * comment, "we only need to eliminate the names from B that are not part
++ * of A_wants") is structurally UNACHIEVABLE for an entire license type
++ * whenever A requests no command of it -- not a corner case, a
++ * deterministic outcome. DOWNSTREAM CONSEQUENCE, distinct in character
++ * from the dummy case: this stuck leftover carries REAL, VALID license
++ * data (unlike the dummy's internally-mismatched data), so it is not a
++ * data-corruption risk -- but if it lands at index 0 of
++ * pimScriptLoop::OnInstall()'s unconditional GetAllCommandNames() read
++ * (same mechanism, same document-order caveat as the stuck-dummy finding
++ * above), [LM_LICENSE_FILE] would be populated from a license type the
++ * user's A never selected at all -- a real, valid, but UNREQUESTED license
++ * silently determining the entitlement's generated install scripts.
++ *
++ * CONFIRMED BUG, found in a further dedicated pass specifically on this
++ * function's AppendAddCommand() return-value check -- not a new function,
++ * a precise per-call-site trace of what checking it would actually
++ * reveal, mirroring the DeleteCommand() return-value pass above but
++ * finding a more severe, more clearly reachable failure mode. There are
++ * exactly 2 AppendAddCommand() call sites (:389,403), and both discard
++ * the return value.
++ *
++ * Traced AppendAddCommand()'s own implementation (pimCommandMgr.cxx:310-403):
++ * it is ADD-OR-UPDATE -- if FindPsfNode(name) already finds a node with
++ * that name, creation is skipped and the existing node is simply updated
++ * (this branch ALWAYS succeeds). But when name does NOT already exist, a
++ * NEW node must be created, and that depends on
++ * FindPsfTempateNode(LicType) (:923-929) finding a matching
++ * <PSF_TEMPLATE> -- if none exists, Node stays NULL, no node is ever
++ * created, and the trailing AppendEditCommand() call's own FindPsfNode()
++ * lookup also fails, so the entire function returns false with ZERO trace
++ * of the attempt anywhere in Eb's document -- no dummy, no leftover,
++ * nothing.
++ *
++ * SITE 1 (:389), the dummy -- confirmed LOWER reachability: lictype2 here
++ * is read moments earlier (GetCommandInfoByName(A_wants[i], lictype2, ...),
++ * :379) directly from an EXISTING, LIVE <PSF> command already present in
++ * Eb's own document. Since something had to create that original command,
++ * a corresponding <PSF_TEMPLATE> for lictype2 plausibly already exists in
++ * B's own template set -- not 100% guaranteed absent a schema or sample
++ * XML in this archive, but structurally far less likely to be missing
++ * than a type sourced from an entirely different document (see SITE 2).
++ *
++ * SITE 2 (:403), the main re-add loop -- CONFIRMED, more severe and more
++ * clearly reachable: this is the loop that actually fulfills A's request
++ * for every wanted command name. When A_wants[i] is a name that does NOT
++ * already exist anywhere in Eb's document (the earlier
++ * if (B_cmds.GetCommandInfoByName(A_wants[i], ...)) check at :379 returned
++ * false -- A wants a command B's original template never had under this
++ * name at all), a NEW node must be created, and its lictype comes from
++ * A_cmds.GetCommandInfoByName() -- a value read from A's document,
++ * entirely independent of what <PSF_TEMPLATE> entries B actually ships.
++ * If B's media doesn't happen to define a template for that license type
++ * at all (a real, plausible cross-version/cross-product mismatch -- e.g.
++ * A is an older or customized request XML naming an add-on license
++ * feature the currently-matched B media doesn't include),
++ * AppendAddCommand() silently fails, and A's entire request for that
++ * named PSF/license command is DROPPED WITHOUT A TRACE -- not stuck like
++ * a dummy, not present with wrong data, simply ABSENT from Eb, as if the
++ * user never asked for it.
++ *
++ * CONFIRMED by this function's own reasoning: its inline comment
++ * introducing this loop ("now we know that all the names we want to use
++ * are either not already used or match the same type...") shows the
++ * author explicitly reasoned through the name/type-collision problem the
++ * earlier block handles, but never considered whether a <PSF_TEMPLATE>
++ * exists at all for a genuinely new name's license type -- a confirmed
++ * blind spot in the function's own design, not a deliberately accepted
++ * risk.
++ *
++ * DOWNSTREAM CONSEQUENCE, traced for the first time: since the failed
++ * AppendAddCommand() never adds anything to Eb, the name in question
++ * never even appears in the final cleanup loop's B_avail re-fetch
++ * (:407-408) -- there is nothing to strand, unlike the DeleteCommand()
++ * findings above. The user's requested licensed feature/capability is
++ * simply never provisioned in the generated entitlement at all, with NO
++ * dummy, no log, no property, and no error anywhere in the entire
++ * pipeline to indicate the omission -- a strictly silent drop, arguably
++ * harder to diagnose than either of the DeleteCommand() findings, since
++ * there is no leftover artifact for a later investigation to even notice.
++ *
++ * See docs/classes/pimSilent.md's Risk Analysis.
++ */
+ bool pimSilentFixupPSF(pimEntitlement &Ea, pimEntitlement &Eb);
++/**
++ * Mirrors Ea's shortcut on/off states onto Eb's matching shortcuts (by ID)
++ * and copies over any shortcut Ea has that Eb lacks. Confirmed called only
++ * from pimSilentCreateEntitlement().
++ *
++ * CONFIRMED BUG (already documented from the caller side in
++ * docs/classes/pimShortcutMgr.md's Risk Analysis): the 4 SetShortcut*State()
++ * calls in the matched-ID branch use B_avail[i] -- an index into a
++ * DIFFERENT array than the one `i` actually indexes -- instead of the
++ * correct A_wants[i], so the wrong shortcut's location-toggle states can be
++ * overwritten whenever A_wants/B_avail's document orders diverge.
++ *
++ * CONFIRMED BUG, found in a later, dedicated pass on this function itself:
++ * GetShortcutProgramMenu()'s return value is silently ignored and
++ * SetShortcutProgramMenu() is called unconditionally, so a stale Program
++ * Menu group name from an earlier, unrelated shortcut in the same loop can
++ * be copied onto the current shortcut (or, on the first iteration, blanked
++ * to empty) -- confirmed by direct contrast with the correctly
++ * return-value-guarded GetShortcutStartDir()/SetShortcutStartDir() call 3
++ * lines later in the same function.
++ *
++ * REACHABILITY, confirmed in a further dedicated pass on this specific bug:
++ * <PROGRAMSMENU> is confirmed to be an INDEPENDENTLY OPTIONAL per-shortcut
++ * child (pimShortcutLoop.cxx:88-341 parses it as one of several
++ * independently present-or-absent siblings of <SHORTCUT>) -- a shortcut
++ * offered only via Desktop/Quicklaunch legitimately has no <PROGRAMSMENU>
++ * node at all, so this bug's trigger condition is a normal configuration,
++ * not a contrived edge case.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass), concrete and deterministic
++ * (unlike pimSilentFixupPSF()'s document-order-dependent caveat):
++ * pimEntitlement::InstallShortcuts() (pimEntitlement.cxx:5778-5787) calls
++ * pimShortcuts::GetInstance().Create(xmlPtr) on this SAME pimXmlFile*
++ * document at real install-execution time. pimShortcutLoop::OnInstall()
++ * (pimShortcutLoop.cxx:324-326,654-671) reads the shortcut's
++ * <PROGRAMSMENU> text and uses it DIRECTLY AS A FILESYSTEM SUBFOLDER PATH
++ * to place the installed .lnk file. If the stale value is non-empty (from a
++ * different shortcut), the icon lands in THAT OTHER SHORTCUT's folder --
++ * a visible misplacement. If the stale value is empty (first iteration),
++ * the Program-Menu placement is silently skipped entirely, even if this
++ * shortcut's own "create in Programs Menu" boolean flag was set true.
++ *
++ * FIX VERIFIED, found in a further dedicated pass specifically verifying
++ * this bug's already-proposed fix: gating SetShortcutProgramMenu() on
++ * GetShortcutProgramMenu()'s return value (mirroring the adjacent
++ * GetShortcutStartDir()/SetShortcutStartDir() pattern) is CONFIRMED
++ * SUFFICIENT -- traced SetShortcutProgramMenu()'s own implementation
++ * (pim_ui/pim_ui_src/pimShortcutMgr.cxx:169-189) to confirm skipping the
++ * call leaves Eb's shortcut untouched, so its own original template value
++ * survives intact, eliminating every corruption path above.
++ *
++ * NEW LIMITATION, found in the same pass (shared by the fix AND the
++ * pattern it mirrors, not introduced or left unaddressed by the fix
++ * itself): neither SetShortcutProgramMenu() nor SetShortcutState()
++ * (pimShortcutMgr.cxx:426-454, the shared primitive behind
++ * SetShortcutProgramsMenuState()'s toggle) nor SetShortcutStartDir()
++ * itself (:213-233) can ever CREATE a missing child node -- all 3 only
++ * mutate an EXISTING one. So even with the fix applied, A can never grant
++ * a shortcut a Program-Menu (or start-directory) customization that B's
++ * own media template never defined in the first place -- a silent,
++ * non-crashing, by-design ceiling, confirmed consistent with
++ * pimShortcutLoop::OnInstall()'s own parsing (pimShortcutLoop.cxx:159-189)
++ * simply never matching an absent node, not a defect.
++ *
++ * ARRAY-INDEX FIX VERIFIED, found in a further dedicated pass specifically
++ * verifying the array-index bug's already-proposed fix: replacing
++ * B_avail[i] with A_wants[i] in all 4 SetShortcut*State() calls is
++ * CONFIRMED SUFFICIENT -- the enclosing
++ * if (B_avail.Find(A_wants[i]) != -1) guard already proves A_wants[i]
++ * exists in Eb's document, so FindShortcutNode(A_wants[i])
++ * (pimShortcutMgr.cxx:417-424, called inside SetShortcutState()) is
++ * guaranteed to locate the same shortcut the 2 immediately-following field
++ * copies already correctly target. No staleness risk either: B_avail is
++ * captured once, before either loop begins, and nothing in this function
++ * mutates Eb's document STRUCTURE (only existing attribute values), so the
++ * snapshot stays valid for the loop's full duration.
++ *
++ * NEW LIMITATION, generalized in the same pass from the Program-Menu-fix
++ * finding above: all 4 of SetShortcutStartMenuState()/
++ * SetShortcutProgramsMenuState()/SetShortcutDesktopState()/
++ * SetShortcutQuicklaunchState() -- not just SetShortcutProgramsMenuState(),
++ * the only one traced above -- delegate identically to the same shared
++ * SetShortcutState() primitive, each passing a different Match tag. Since
++ * all 4 corresponding child elements are independently optional per
++ * shortcut, SetShortcutState() can legitimately return false for a
++ * CORRECTLY IDENTIFIED shortcut whenever that one specific location option
++ * was never offered by Eb's template -- and none of the 4 array-index call
++ * sites check this return value, fix or no fix. Same silent,
++ * non-crashing, by-design ceiling as the Program-Menu bug's own fix, now
++ * confirmed to span all 4 location toggles instead of 1.
++ *
++ * VERIFIED NON-ISSUE, found while tracing this same call chain:
++ * GetShortcutInfoByID(A_wants[i], unused, unused, sm, pm, dt, ql) (:455)
++ * also discards its own bool return, and sm/pm/dt/ql are declared once,
++ * outside the loop -- the same shape as the confirmed-live Program-Menu
++ * and <PROPERTY>-copy staleness bugs elsewhere in this file. Traced
++ * GetShortcutInfoByID()'s implementation
++ * (pim_ui/pim_ui_src/pimShortcutMgr.cxx:29-101) to confirm this instance is
++ * NOT reachable: it fails only when FindShortcutNode(id) finds no node, but
++ * A_wants[i] is sourced from A_shtcuts.GetAllShortcutIDs() (:295-320)
++ * scanning the SAME document by the SAME id attribute FindShortcutNode()
++ * matches on, so the node is always found. This call site's design is also
++ * more defensive than its Program-Menu sibling: on success, all 4 output
++ * booleans are unconditionally reset to false (:40-43) BEFORE the
++ * child-scan, so an absent child yields a correct false rather than a
++ * carried-over stale value -- the exact safeguard GetShortcutProgramMenu()
++ * omits.
++ *
++ * ADJACENT PRE-EXISTING RISK, found in the same trace, unrelated to and not
++ * introduced by the array-index fix: GetAllShortcutIDs()
++ * (pim_ui/pim_ui_src/pimShortcutMgr.cxx:312-313) dereferences its id
++ * attribute node's getNodeValue() with no null check -- a latent crash if
++ * any <SHORTCUT> node in either document ever lacks an id attribute. This
++ * underlies both A_wants and B_avail alike, so it is a shared precondition
++ * of this entire function's algorithm.
++ *
++ * See docs/classes/pimSilent.md's Risk Analysis.
++ */
+ bool pimSilentFixupShortcuts(pimEntitlement &Ea, pimEntitlement &Eb);
+ 
++/**
++ * Adds B to the session as a new pimEntitlement, then copies A's
++ * platform/language/package selections, quality-agent flag, a subset of
++ * <MSI> node attributes, and most <PROPERTY> values onto it (skipping
++ * [SHIPCODE]/[VERSION]/[SOURCE]/CustomActions), then calls
++ * pimSilentFixupPSF()/pimSilentFixupShortcuts(). Confirmed sole call site:
++ * pim/pim_src/pimTop.cxx:1535, immediately after a successful
++ * pimSilentTestXmlIsUseable() check.
++ *
++ * CONFIRMED, found in a dedicated pass on this function: its package-
++ * selection loop calls the identical pimPackageMgr::GetInstallPackageNames()
++ * on A, under the same 3 global command-line mode flags, that
++ * pimSilentCanMatchNeeds() uses for its own compatibility check on the same
++ * A/B pair -- since this function only ever runs immediately after a
++ * successful pimSilentCanMatchNeeds() call in the same process, the 2 calls
++ * are guaranteed to see identical mode flags. This CORRECTS an earlier
++ * characterization of pimSilentCanMatchNeeds()'s mode-dependent package
++ * check as a validation gap: the 2 functions are consistent with each
++ * other, not in conflict -- see pimSilentCanMatchNeeds()'s own comment.
++ *
++ * CONFIRMED BUG, found in a further dedicated pass specifically on this
++ * function's <MSI>-node copy loop (:604-684), upgraded from a
++ * lower-confidence structural note: the read loop (from A) declares
++ * format/Cmd ONCE outside the loop, so every iteration silently overwrites
++ * them -- only the LAST <MSI> node in A's document order survives. The
++ * write loop then stamps that ONE surviving value pair onto EVERY <MSI>
++ * node in B, erasing distinctions between B's own, independently-configured
++ * MSI packages.
++ *
++ * REACHABILITY, confirmed in this pass (not merely hypothetical, upgrading
++ * the prior "no product XML available to test" caveat): pimMSILoop::pimMSIExec()
++ * (pimMSILoop.cxx:154-161, the actual MSI install-execution driver, already
++ * a fully documented pimLoop subclass) independently iterates EVERY <MSI>
++ * node via the identical getElementsByTagName(pimMSI) call, skipping only
++ * IsEligibleForInstall() rejects, and executes each eligible node as its
++ * own separate MSI install action -- confirming multi-<MSI>-node product
++ * XML is a real, designed-for, normally-executed configuration, not a
++ * hypothetical edge case. pimMSIExec()'s own <MSIARGUMENT> reading (:249-260)
++ * even correctly concatenates ALL <MSIARGUMENT> children of a single node,
++ * unlike this function's cruder single-value GetChildNodeByNodeName() read.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE (same pass): the single format/Cmd pair
++ * stamped onto every <MSI> node in B is exactly what pimMSILoop::pimMSIExec()
++ * reads PER NODE at real install-execution time -- attribFormat
++ * (pimMSILoop.cxx:596-614) directly selects that node's install UI MODE
++ * ("full" interactive wizard, "basic", or silent), and the <MSIARGUMENT>
++ * text feeds that node's msiexec.exe command line. If B legitimately has
++ * 2+ MSI packages meant to install under DIFFERENT UI modes or arguments,
++ * this bug forces all of them to adopt whichever single mode/argument pair
++ * belonged to the LAST <MSI> node read from A -- a confirmed, install-time
++ * consequential data-corruption bug that can visibly change which
++ * installer UI a user sees during a multi-package MSI install.
++ *
++ * FIX VERIFIED, found in a further dedicated pass specifically verifying
++ * this bug's already-proposed fix ("match by node identity, e.g. the
++ * pimname/pimPRODUCTCODE attribute, instead of collapsing all nodes'
++ * values into one pair of shared variables"): traced pimMSIExec()'s own
++ * attribute reads (pimMSILoop.cxx:202-207) off the IDENTICAL <MSI>
++ * nodelist this function iterates -- CONFIRMS both `name` and
++ * `PRODUCTCODE` genuinely exist on real <MSI> nodes in this codebase, not
++ * speculative attribute names.
++ *
++ * BUT the fix's own "either" phrasing is UNDER-SPECIFIED -- the 2 keys
++ * have OPPOSITE tradeoffs for the cross-version matching this function
++ * exists to perform: PRODUCTCODE is a Windows Installer GUID
++ * conventionally expected to change on most new MSI builds (a
++ * well-established external convention, not itself confirmed from this
++ * archive, since no MSI-authoring documentation exists in it) -- a
++ * PRODUCTCODE-only match would likely find NO correspondence at all
++ * between A's (older/customized) request XML and B's (newly matched)
++ * media in the realistic case this function handles, silently degrading
++ * the "fix" to "no customization ever survives" -- trading the confirmed
++ * corruption bug for a confirmed loss of the feature's entire purpose.
++ * `name`, by contrast, is a stable, human-authored label far more likely
++ * to persist across a product's version history, making it the
++ * practically workable primary key -- but is NOT enforced unique by any
++ * schema in this archive, so 2 <MSI> nodes sharing the same name (not
++ * confirmed to occur, but not ruled out) could still collide under
++ * name-only matching. A robust implementation would need to try
++ * PRODUCTCODE first (exact package identity, when it happens to match)
++ * and fall back to `name` (broader, version-tolerant reach) -- neither
++ * the original bug report nor the proposed fix's own phrasing specifies
++ * this fallback design.
++ *
++ * NEW ASYMMETRY, found while verifying the fix, orthogonal to the
++ * name-collapsing bug: even before per-node matching, the existing write
++ * loop's own format-attribute handling (:654-661 in pimSilent.cxx) only
++ * overwrites B's format attribute IF B's own node already has one (no
++ * else branch to create it), while the <MSIARGUMENT> child-element
++ * handling immediately below (:663-673) DOES create a missing child. Any
++ * correctly-scoped per-node fix must consciously preserve or correct this
++ * existing create-vs-update-only asymmetry between the 2 fields it
++ * copies, not just the node-identity matching -- a design detail the
++ * original bug report and its proposed fix did not address.
++ *
++ * CONFIRMED, found in a further dedicated pass specifically on this
++ * function's <PROPERTY> skip list ([SHIPCODE]/[VERSION]/[SOURCE]/
++ * CustomActions, :690-693): each has a distinct, confirmed downstream
++ * reason to stay B's own. [SHIPCODE] is read immediately after Eb's
++ * creation by pimSilentInstallFromXML() (pimTop.cxx:1556-1559) to populate
++ * the session's own SHIPCODE_PROPERTY from Eb's OWN value. [VERSION] is
++ * originally set by pimEntitlement::Init() itself (pimEntitlement.cxx:944,
++ * 1195) from Eb's own <PRODUCT version> attribute, and later read by
++ * pimCustomActionsLoop (pimCustomActions.cxx:542) and pimSessionInfo
++ * (pimSessionInfo.cxx:1801,2316) for version-gated/cross-entitlement
++ * matching. [SOURCE] is unconditionally overwritten anyway moments after
++ * this function returns (pimTop.cxx:1598). CustomActions gates MANY real
++ * install/uninstall lifecycle hook points via
++ * pimEntitlement::OnInstallCustomActions()/OnUninstallCustomActions()'s
++ * xmlPtr->GetProperty("CustomActions", str) truthy-check
++ * (pimEntitlement.cxx:5151,5882,6024,6669,6753,6837,6842,7023,7159,7228,
++ * 7309), each constructing a pimCustomActionsLoop -- a NEWLY-DISCOVERED
++ * pimLoop subclass (pimCustomActions.h/.cxx) not previously mentioned
++ * anywhere in this doc set -- on the same xmlPtr; the property's mere
++ * PRESENCE, not even its value, gates whether B's own custom-action
++ * fixups run at all.
++ *
++ * VERIFIED NON-ISSUE, not a bug: the copy loop's `name` variable (:688) is
++ * declared once outside the loop, so a <PROPERTY> node lacking a `name`
++ * attribute would leave `name` stale from a prior iteration when the skip
++ * check runs -- but the copy loop's own guard (attribName != NULL, :712)
++ * means 0 copies happen either way, so the stale value has no effect,
++ * unlike the superficially similar but genuinely live bug already
++ * documented above in pimSilentFixupShortcuts().
++ *
++ * FIX VERIFIED (COSMETIC), found in a further dedicated pass specifically
++ * verifying this loop's proposed hardening fix ("initialize the loop's
++ * name variable fresh each iteration"): CONFIRMED still cosmetic today --
++ * traced precisely which guard does the real work: the inner for-loop's
++ * own attribName != NULL condition (:712) is the SOLE, always-present
++ * safety net for a nameless <PROPERTY> node, regardless of what the outer
++ * skip-list `continue` (:710-711) does with a stale name. Applying the fix
++ * (name.Clear(), or re-declaring name inside the loop -- confirmed
++ * equivalent) changes nothing observable: PropertyNamesToKeepUnchanged.Find("")
++ * finds no match so the continue no longer fires, but the inner loop's own
++ * guard still independently produces 0 copies -- the same net result.
++ * The fix's real value is closing a LATENT MAINTENANCE TRAP, not fixing a
++ * live bug: a plausible future refactor "simplifying" the inner loop's
++ * condition to just `i < map->getLength()` (reasoning, incorrectly, that
++ * the outer continue already handles the no-name case) would silently
++ * reintroduce exactly the kind of stale-value corruption already confirmed
++ * live in pimSilentFixupShortcuts()'s Program Menu bug, since the outer
++ * continue's protection was never real to begin with.
++ *
++ * CONFIRMED BUG, found in the same pass, by tracing this loop's full
++ * return-value chain -- a NEW finding, distinct from the name-staleness
++ * issue: pimXmlFile::GetProperty() (pimXmlFile.cxx:783-808) is called at
++ * BOTH value-copy sites (:719, the pimname/text-content case; :725, the
++ * general-attribute case) with its own bool return value DISCARDED.
++ * GetProperty() internally calls GetPropertyNode(name, &matchedNode)
++ * (pimXmlFile.cxx:755-781), which searches Ea's ENTIRE document, by name,
++ * for the FIRST <PROPERTY> node matching in document order -- not
++ * necessarily the same node this do/while loop is currently iterating. If
++ * that search fails, or the matched node lacks the specific attrib being
++ * requested, GetProperty() returns false and leaves `value` ENTIRELY
++ * UNTOUCHED -- but Eb->GetXMLPtr()->SetProperty(name, value, ...) (:720,
++ * :726) is called UNCONDITIONALLY regardless, potentially writing a stale
++ * value carried over from a previous, unrelated attribute or property
++ * earlier in the same loop onto B.
++ *
++ * REACHABILITY, precisely characterized: for the current node's own
++ * attributes, this can only actually diverge when Ea's document contains
++ * 2 OR MORE <PROPERTY> nodes sharing the same `name` -- not prevented by
++ * any schema in this archive -- in which case GetPropertyNode()'s
++ * document-order search returns the FIRST duplicate, not necessarily the
++ * one currently being iterated; if that first duplicate lacks the
++ * specific attribute the current node has, the copy silently uses a stale
++ * value instead. Not confirmed reachable against a real product XML (none
++ * exists in this archive), but the mechanism is fully confirmed from
++ * source, and mirrors -- in a previously unexamined location -- the exact
++ * "discarded Get() return + reused stale variable" pattern already
++ * confirmed live in pimSilentFixupShortcuts()'s Program Menu bug.
++ *
++ * A MORE ROBUST ALTERNATIVE, already available in the code's own hands:
++ * for the general-attribute branch (:722-727), `attrib` (obtained via
++ * map->item(i), :714) IS ALREADY the exact DOM attribute node whose value
++ * is wanted -- attrib->getNodeValue() would read it directly, with no
++ * document-wide re-search, no dependency on `name` uniqueness, and no
++ * staleness risk at all, making the current indirect
++ * GetProperty()/SetProperty() roundtrip unnecessary for this branch
++ * specifically. The pimname/text-content branch (:717-720) genuinely
++ * needs the indirect lookup, since the wanted value (the property's text
++ * content) isn't available directly from `attrib` -- but its discarded
++ * return value is not otherwise addressed by this simplification and
++ * would still need an explicit check.
++ *
++ * CONFIRMED BUG, found in a further dedicated pass specifically on this
++ * function's session-index lookup (:510-530): the entitlement_index
++ * out-parameter is set to a valid, non-negative index at :520 --
++ * immediately after AddEntitlement(B) succeeds -- but A's own parseability
++ * isn't checked until :522-524, and if Ea.Init(A) fails under BOTH schemas
++ * (normal and EXTERNAL_INSTALLER), this function returns false at :530
++ * WITHOUT resetting entitlement_index. Traced the only caller
++ * (pimTop.cxx:1534-1540): `k = -1;` is set before the call, then
++ * `if (k < 0) { abort = true; return pimGetLastError(); }` is the caller's
++ * ENTIRE failure check -- this function's own bool return value is never
++ * inspected at all. Since entitlement_index/k is already overwritten to a
++ * valid index at :520, a failure on the :522-530 path leaves k >= 0 even
++ * though the function is reporting failure -- the caller's only
++ * failure-detection sentinel cannot catch this specific failure mode, and
++ * execution proceeds treating a half-created B (added to the session, but
++ * never reaching pimSilentFixupPSF()/pimSilentFixupShortcuts() at
++ * :736,739) as if creation fully succeeded.
++ *
++ * REACHABILITY, precisely characterized: not confirmed reachable via this
++ * codebase's own single call site. pimSilentTestXmlIsUseable()
++ * (pimTop.cxx:1532, called immediately before, gating entry into this
++ * branch, on the IDENTICAL A input) already requires
++ * pimIsProductXmlMatch()'s internal Ea.Init(A, NULL) ||
++ * Ea.Init(A, "EXTERNAL_INSTALLER") (pimSilent.cxx:112,122) to succeed for
++ * the same file before this call is ever reached -- so by the time this
++ * function runs, A's parseability under one of the same 2 schemas is
++ * already established, synchronously, in the same process. A confirmed
++ * gap in this function's own error-handling design, latent given the
++ * current call graph, not a live crash/corruption risk today.
++ *
++ * VERIFIED NON-ISSUE, a related but distinct mechanism (checked while
++ * tracing why GetEntitlementSize()-1 reliably indexes the just-added
++ * entry): pimSessionInfo::AddEntitlement(cStringT)
++ * (pimSessionInfo.cxx:654-705)'s own pre-existing-entry guard,
++ * `if (GetEntitlement(in) != NULL) return false;` (:658), compares a
++ * filesystem PATH (`in`) against GetEntitlement(cStringT)'s match key,
++ * GetID() -- populated from the product's <PRODUCT tag> attribute
++ * (pimEntitlement.cxx:874), not a path -- so this guard is confirmed to
++ * never actually fire in practice. This confirms AddEntitlement()
++ * returning true always means a brand-new array entry was truly just
++ * appended (EntitlementArray += ptr, :683), never a reused one -- the
++ * session-index lookup's own core arithmetic is otherwise sound; only its
++ * reporting back to the caller on a later failure is broken.
++ *
++ * SESSION-INDEX FIXES VERIFIED, found in a further dedicated pass
++ * specifically verifying the 2 proposed fixes above -- (a) check this
++ * function's bool return value at the call site too, or (b) reset
++ * entitlement_index to -1 on this function's own failure path: BOTH
++ * CONFIRMED SUFFICIENT, independently. Re-read the full function body
++ * (:501-746) to confirm there is exactly 1 failure path to fix (:524-531)
++ * -- no other early return exists between :520 (where the index is set)
++ * and the final return true; at :743. Fix (a) needs no change to this
++ * file; fix (b) needs no caller-side change, since the caller already
++ * checks nothing but k's sign.
++ *
++ * DOWNSTREAM CONSEQUENCE, traced one step further than before: followed
++ * the caller's loop forward from the undetected-failure point. Execution
++ * falls through the full per-entry post-creation block
++ * (pimTop.cxx:1542-1751) and, once the whole AskedToInstallThisList loop
++ * completes without any OTHER entry aborting, reaches pimTop.cxx:1777's
++ * SessionInfo.Save() -- traced to xmlPtr->DoSave()
++ * (pimSessionInfo.cxx:2220-2226), which PERSISTS the corrupted session
++ * document, including the orphaned <ENTITLEMENT id="..."> node
++ * AddEntitlement(B) appended for the half-created B
++ * (pimSessionInfo.cxx:687-694), to sessioninfo.xml on disk. Traced
++ * pimXmlFile::PreWrite()/PostWrite() (pimXmlFile.cxx:216-236, pure
++ * thread-lock bookkeeping) and ~pimXmlFile() (:146-187, frees resources,
++ * never saves) to confirm Save() is the ONLY path from this silent-install
++ * loop that could ever write this corruption to disk. Either fix
++ * eliminates it: correctly detected, abort=true; return
++ * pimGetLastError(); (pimTop.cxx:1538-1540) fires BEFORE line 1777 is ever
++ * reached, so the corrupted state is simply discarded when the caller's
++ * stack-local SessionInfo object (pimTop.cxx:1332) is destroyed on return
++ * -- confirmed via ~pimSessionInfo() (pimSessionInfo.cxx:175-199), which
++ * deletes EntitlementArray's contents and xmlPtr without saving either.
++ *
++ * CONFIRMED BUG in fix (b)'s own alternative wording: "...or call
++ * DropEntitlement(B) to roll back" is NON-FUNCTIONAL as written --
++ * pimSessionInfo::DropEntitlement(cStringT) (pimSessionInfo.cxx:784-801)
++ * matches via EntitlementArray[i]->GetID() == in, the IDENTICAL
++ * "path vs. product tag" mismatch already confirmed dead code in
++ * AddEntitlement()'s own guard above. B is the same path already passed
++ * to AddEntitlement(B); DropEntitlement(B) suffers the identical mismatch
++ * and always returns false, rolling back nothing. A working rollback
++ * needs DropEntitlement(entitlement_index) instead -- the sibling int
++ * overload (pimSessionInfo.cxx:803-814), confirmed correct by direct
++ * trace (bounds-checks, then RemoveAt(ct) + delete), using the value
++ * already in hand -- or DropEntitlement(Eb->GetID()), since Eb's tag is
++ * already populated by Init() at this point; never the path.
++ *
++ * VERIFIED NON-ISSUE, given the consequence traced above: a full
++ * DropEntitlement()-based rollback is confirmed NOT NECESSARY for
++ * correctness today -- since the fixed detection always returns before
++ * Save() is reached, the simpler fix (reset entitlement_index, or check
++ * the return value) is fully sufficient on its own; a real rollback would
++ * only matter if this function ever gained a 2nd, longer-lived caller
++ * that keeps SessionInfo alive and keeps calling after a failure -- not
++ * the case today, given the single call site traced above.
++ *
++ * CONFIRMED BUG, found in a further dedicated pass specifically on this
++ * function's quality-agent flag copy (:593-599): traced
++ * Ea.IsQualityAgentEnabled(tf)/Eb->SetQualityAgent(tf) into
++ * pimEntitlement::SetQualityAgent() (pimEntitlement.cxx:3225-3248).
++ * ENABLING (in==true) always succeeds whenever Eb's <QUALITYAGENT> node
++ * exists at all. DISABLING (in==false) is silently REFUSED -- the
++ * function's own bool return stays false, `enable` is left unchanged --
++ * whenever Eb's own node is marked required="Y", a business rule about
++ * B's own media definition, unrelated to what A requested. This function
++ * discards the return value at both call sites (:596,598), so a user's
++ * explicit "disable quality agent" request in A can be silently
++ * overridden by B's own required flag, with ZERO diagnostic anywhere.
++ *
++ * CONFIRMED, by direct contrast with this codebase's own GUI path:
++ * pim_ui/pim_ui_src/pimCustomDlg.cxx:1630-1655 (building the "Customize"
++ * dialog's QualityAgent checkbox) calls IsQualityAgentRequired() FIRST
++ * and, when required, disables ("greys out") the "QualityAgentOptIn"
++ * checkbox control entirely (:1650-1654) -- structurally preventing a
++ * live user from ever attempting the disable this function blindly
++ * attempts. uiCustomTree::OnUpdate() (:1727-1730) only ever calls
++ * SetQualityAgent() when the checkbox was actually interactive, i.e.
++ * never on a required entitlement. No equivalent precondition check
++ * exists in this silent-install path.
++ *
++ * REACHABILITY, precisely characterized: unlike the package check
++ * (protected by pimSilentCanMatchNeeds()'s own earlier validation),
++ * nothing in this pipeline pre-validates QualityAgent state at all --
++ * pimSilentCanMatchNeeds() (:227-346) never inspects <QUALITYAGENT> in
++ * either A or B. A plausible, real-world trigger: A is an older
++ * saved/exported install-request XML with quality agent explicitly
++ * disabled, applied against B, a newer product release whose media
++ * definition has since made quality agent required="Y" (a policy
++ * change) -- the user's prior, explicit opt-out is silently discarded on
++ * reapplication, with no upstream gate to catch it.
++ *
++ * CONFIRMED DOWNSTREAM CONSEQUENCE, traced for the first time: Eb's final
++ * enable state is read at real install-execution time by
++ * pimEntitlement::OnInstall() (:6499-6509) and OnReconfigure()
++ * (:7051-7060) to write (pimAppendValue(PtcKey, "QualityAgentOptIn", "1"))
++ * or remove (pimRemoveName(PtcKey, "QualityAgentOptIn")) a real Windows
++ * registry value. The GUI's own "PHM" (Product Health Monitoring) message
++ * key and "legal text" control naming
++ * (pimUICustomDlgEnablePHM/CustomizeScreenQualityAgentLegalText) confirm
++ * this is a genuine, user-facing telemetry/usage-reporting opt-in setting
++ * with consent implications -- not merely a latent XML-consistency
++ * concern.
++ *
++ * VERIFIED NON-ISSUE: the enable direction carries no equivalent
++ * restriction -- a request to turn ON quality agent, or a B with no
++ * <QUALITYAGENT> node at all (nothing to set, SetQualityAgent() harmlessly
++ * returns false), is never a live corruption risk; only a DISABLE request
++ * against a REQUIRED B silently fails.
++ *
++ * CONFIRMED BUG, found in a further dedicated pass specifically on this
++ * function's package-selection loop (:571-586), directly analogous to the
++ * quality-agent bug above: traced SetPackageInstallState(name, false)
++ * (pimPackageMgr.cxx:250-336). It refuses and leaves the package's install
++ * attribute UNCHANGED -- returning false -- whenever that package is
++ * marked required="Y", OR already marked installed="Y" (with a single
++ * named exception, "prime_converter", carved out of the 2nd check). This
++ * function's loop discards the return value at both call sites (:582,584),
++ * so a required or already-installed B package silently keeps whatever
++ * install state it already had, contrary to A's explicit non-request, with
++ * ZERO diagnostic anywhere.
++ *
++ * CONFIRMED, by direct contrast with this codebase's own GUI path,
++ * mirroring the quality-agent precedent exactly: pim_ui/pim_ui_src/
++ * pimCustomDlg.cxx's uiCustomTree::RefreshPkg() (:1819-1904) reads the
++ * identical req/installed flags and, when either is true
++ * (if (req || installed), :1900), proactively disables the checkbox
++ * (UI_check_sensitive_Attr, false, :1903) -- structurally preventing a
++ * live user from ever attempting the disable this function blindly
++ * attempts. No equivalent precondition check exists in the silent-install
++ * path.
++ *
++ * NEW NUANCE: even on a refused disable, this function's own special-case
++ * handling for 2 hardcoded package names -- "prime_converter"/
++ * "creo_simulate" (pimPackageMgr.cxx:276-302) -- runs BEFORE the
++ * required/installed check and toggles their respective global mode flags
++ * (pimSetPrimeInWSMode()/pimSetSimulateInMode()) to the ATTEMPTED (refused)
++ * value regardless -- a confirmed state divergence between the persisted
++ * XML attribute (unchanged) and these 2 global flags (updated), for those
++ * 2 packages only.
++ *
++ * REACHABILITY: unlike quality agent, package selection IS validated
++ * earlier by pimSilentCanMatchNeeds() -- but that check only confirms
++ * every package A WANTS exists in B; it never inspects whether a package A
++ * doesn't want is required/installed in B, so this bug's trigger
++ * condition is entirely outside that check's scope. A plausible trigger:
++ * B's media has since made a package required (or the machine already has
++ * it installed from a prior run) that A's older request XML doesn't
++ * select -- the user's implicit "I don't want this" is silently
++ * discarded.
++ *
++ * DOWNSTREAM CONSEQUENCE: whatever this loop settles as each package's
++ * final install attribute feeds directly into
++ * pimPackageMgr::Refresh()/RefreshAFeatureNode() (see below), which
++ * governs real <CDSECTION>/<MSI> feature install-eligibility -- so a
++ * silently-retained required/installed package continues to have its real
++ * features installed, contrary to A's explicit non-request.
++ *
++ * VERIFIED NON-ISSUE: this function's own B_pkg.Refresh() call (:586) is
++ * confirmed WASTED, not incorrect -- it computes <CDSECTION>/<MSI>/<SFX>
++ * install eligibility using platform/language selections mirrored from A's
++ * static XML markings moments earlier in this same function, but
++ * pimSilentInstallFromXML()'s post-creation code (pim/pim_src/pimTop.cxx),
++ * which runs unconditionally right after this function returns, overwrites
++ * platform/language via auto-detection/CLI flags and then calls its OWN,
++ * separate pimPackageMgr::Refresh() (a freshly-constructed MyPkg on the
++ * same document) -- confirmed to supersede this function's own Refresh()
++ * output entirely before anything ever reads it. Also confirmed
++ * GetAllPackageNames() (:577) shares GetInstallPackageNames()'s
++ * already-confirmed unguarded null-attribute crash risk.
++ *
++ * See docs/classes/pimSilent.md's Risk Analysis.
++ */
+ bool pimSilentCreateEntitlement(const char * A, const char * B, int &entitlement_index);
+ 
++/** Validates one silent-install user-specified product XML (file) against KnownProductDefinitions (the media's own XML files): checks for XML syntax errors, a matching product tag (pimIsProductXmlMatch()), version compatibility (pimIsVersionMatch()), and package/language/platform availability (pimSilentCanMatchNeeds()); sets `out` to the matching media XML path on success. Confirmed sole call site: pim/pim_src/pimTop.cxx:1532 (pimSilentInstallFromXML()'s per-entry validation loop), once per entry in its AskedToInstallThisList. CONFIRMED BUG: leaks the internal pimXmlFile object used for the syntax-error check on that error path -- the delete that runs on the success path is skipped by the early return. See docs/classes/pimSilent.md's Risk Analysis. */
+ bool pimSilentTestXmlIsUseable(const char *file, btkFSList &KnownProductDefinitions, btkString &out);
+ 
+ #endif

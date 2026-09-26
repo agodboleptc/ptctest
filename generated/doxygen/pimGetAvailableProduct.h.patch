@@ -1,0 +1,104 @@
+--- a/pim_core/includes/pimGetAvailableProduct.h
++++ b/pim_core/includes/pimGetAvailableProduct.h
+@@ -11,19 +11,42 @@
+ #include <pimCore.h>
+ #include <pimXmlFile.h>
+ 
++/**
++ * A single discovered available product: its name/reference-XML key, plus
++ * the parallel "VerShipcodes" and media-ID arrays discovered for it (kept
++ * in lockstep by AddInstance()/Sort()). Value object owned by
++ * pimGetAvailableProducts' internal map.
++ *
++ * CONFIRMED BUG (docs/classes/pimAvailableProduct.md Risk Analysis):
++ * AddInstance()'s `shipcode` parameter is silently ignored -- despite the
++ * `VerShipcodes` member name and the `pimCompareVerShipcode()` comparator
++ * used in Sort() both implying a combined version+shipcode identifier is
++ * stored, only the bare version string is ever stored/deduped against. Two
++ * calls with the same version but different shipcodes silently drop the
++ * 2nd (its media ID never gets added).
++ */
+ class pimAvailableProduct
+ {
+ private:
+ 	btkString Key;
+ 	btkString Name;
+ 	btkString ReferenceXml;
+-	StringXArray MediaIDs; 
++	StringXArray MediaIDs;
+ 	StringXArray VerShipcodes;
+ public:
+ 	pimAvailableProduct(){}
+ 	~pimAvailableProduct(){}
+ 
++	/** Sets Key/Name/ReferenceXml; @return false if either argument is NULL. */
+ 	bool Init(const char *N, const char *ref_xml);
++	/**
++	 * CONFIRMED BUG: the `shipcode` parameter is never referenced in this
++	 * method's body. It stores and dedups on `V` (the bare version string)
++	 * alone -- `VerShipcodes.Find(V)` -- so a 2nd call with the same version
++	 * but a different shipcode is treated as a duplicate and silently
++	 * dropped, along with its media_id. See
++	 * docs/classes/pimAvailableProduct.md Risk Analysis.
++	 */
+ 	bool AddInstance (const char *V, const char *shipcode, const char *media_id);
+ 
+ 	const char *GetKey() const;
+@@ -32,8 +55,18 @@
+ 
+ 	int GetSize() const; // number of shipcodes (aka same as number of Media ids)
+ 
+-	// TODO 
++	/** Selection-sorts VerShipcodes descending by pimCompareVerShipcode(), applying the identical index swaps to MediaIDs to keep the two arrays in sync. */
+ 	void Sort();
++	/**
++	 * Logs Name/ReferenceXml then each MediaID : VerShipcode pair.
++	 * CONFIRMED DEAD CODE: zero live callers anywhere in this archive. The
++	 * only 2 references to pimGetAvailableProducts::Print() (which simply
++	 * fans out to this method) are both commented out in
++	 * pimGetAvailable.cxx:474,478 (`//AvailableProductsArray.Print(pimDbgLog);`).
++	 * `pimDbgLog` itself is referenced only inside those same commented-out
++	 * lines -- not a confirmed real, live logger object anywhere in this
++	 * codebase. See docs/classes/pimAvailableProduct.md Risk Analysis.
++	 */
+ 	void Print(btkErrLog &);
+ 
+ 	const StringXArray &GetVerShipcodes() const;
+@@ -42,6 +75,12 @@
+ 
+ typedef btkMap < char *, pimAvailableProduct *> ProductXArray;
+ 
++/**
++ * Keyed (by product-definition XML name) collection of pimAvailableProduct,
++ * accumulated by pimGetAvailable::OnExecute() as it walks the web-media
++ * availability feed. See docs/classes/pimAvailableProduct.md and
++ * docs/classes/pimGetAvailable.md.
++ */
+ class pimGetAvailableProducts
+ {
+ private:
+@@ -53,12 +92,14 @@
+ 
+ 	// if it already exists... the existing one is returned
+ 	//
++	/** Looks up by Xml key first; only heap-allocates (XNew) a new pimAvailableProduct on a miss. */
+ 	pimAvailableProduct *Create(const char *Name, const char *Xml);
+ 
+ 	// how many
+ 	int GetSize() const;
+ 
+ 	void Sort();
++	/** Fans out to every contained pimAvailableProduct::Print(). CONFIRMED DEAD CODE: zero live callers -- both call sites in pimGetAvailable.cxx (:474,478) are commented out. See docs/classes/pimAvailableProduct.md Risk Analysis. */
+ 	void Print(btkErrLog &);
+ 
+ 	// by index
+@@ -67,7 +108,9 @@
+ 		return *(Products.GetByIndex(idx));
+ 	}
+ 
++	/** Linear scan by XmlName; returns a shared function-local static empty array on no match. */
+ 	const StringXArray &GetShipcodeOptions(const char *XmlName);
++	/** Linear scan by XmlName; same shared-static-empty-array pattern as GetShipcodeOptions(). */
+ 	const StringXArray &GetAssociatedMediaIDs(const char *XmlName);
+ };
+ 

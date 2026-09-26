@@ -1,0 +1,125 @@
+--- a/pim_core/includes/pimSFXLoop.h
++++ b/pim_core/includes/pimSFXLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   21-Jan-13 P-20-22   TWH   $$1    Created
+@@ -12,11 +12,58 @@
+ #include <pimLoop.h>
+ #include <pimCab.h>
+ 
++/**
++ * Install-step (pimLoop subclass) that runs self-extracting-executable (SFX)
++ * payloads as child processes -- PTC's alternative to MSI for products/
++ * utilities packaged as a plain .exe installer.
++ *
++ * Responsibilities:
++ * - Iterate <SFX install="Y"> elements and launch each referenced executable.
++ * - Interpret the child process's exit code using the same well-known Windows
++ *   Installer exit-code vocabulary as pimMSILoop (many SFX payloads are
++ *   themselves MSI-based). Exit code 1618 is deliberately handled differently
++ *   here (treated as failure) than in pimMSILoop (treated as cancellation).
++ * - Support cooperative termination via a mutex-guarded kill_exec flag,
++ *   polled every 2 seconds while the child process runs.
++ * - Append a successful package's uninstall command line to a shared
++ *   Uninstall_all_utilities.bat file, keyed by product mode.
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - btkProcess (external btk) for child-process creation/monitoring.
++ * - pimConvert for property-placeholder resolution.
++ * - pimSessionInfo for VERSION_PROPERTY/[INSTALLBASE] when building the
++ *   shared uninstall-batch path.
++ *
++ * Owned by: pimSFXCopier (pim_core/includes/pimSFXCopier.h), a process-wide
++ * singleton (GetInstance()) -- NOT a per-entitlement object. Only one SFX
++ * install can be in flight across the whole process at a time.
++ */
+ class pimSFXLoop : public pimLoop
+ {
+ protected:
++	/**
++	 * Thread entry point; resets kill_exec under kMutex, then calls OnInstall().
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * For each <SFX install="Y"> node: resolves the executable path, builds a
++	 * command line from an optional <COMMAND_ARGUMENTS> child, launches it via
++	 * btkProcess::Create(..., btkProcess::Interruptable), polls every 2 seconds
++	 * (checking kill_exec each poll), then dispatches on the exit code (see
++	 * class-level doc for the 1618 divergence from pimMSILoop, and the
++	 * dotNetFx40_Full-specific carve-out for exit code 3010).
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * Standard thread teardown: releases this thread's logger handle, marks
++	 * the Loop done under Mutex, and clears the in-progress flag.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
+ 	btkString Source;
+@@ -26,11 +73,23 @@
+ 	bool kill_exec;
+ 
+ public:
++	/**
++	 * Constructs a pimSFXLoop bound to the given XML content, with kill_exec
++	 * initialized to false.
++	 * @param XMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimSFXLoop(pimXmlFile *XMLContent) : pimLoop(XMLContent)
+ 	{
+ 		kill_exec = false;
+ 	}
+ 
++	/**
++	 * Requests cooperative cancellation via the base pimLoop::Cancel(). Note
++	 * this cannot interrupt an SFX child process already running -- only
++	 * Kill() can do that; a running child finishes naturally before the next
++	 * cancel check in OnInstall()'s loop fires.
++	 * @return void
++	 */
+ 	void Cancel()
+ 	{
+ 		if (1)
+@@ -39,6 +98,11 @@
+ 		}
+ 	}
+ 
++	/**
++	 * Requests termination of the currently-running SFX child process. Takes
++	 * effect on the next 2-second poll inside OnInstall()'s wait loop.
++	 * @return void
++	 */
+ 	void Kill()
+ 	{
+ 		kMutex.Lock();
+@@ -49,7 +113,20 @@
+ 	/*
+ 	 * content that has attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Sets the base source directory used to resolve relative SFX paths.
++	 * @param in Source directory.
++	 * @return void
++	 */
+ 	void pimSetSource(btkString &in) { Source = (cStringT)in; }
++
++	/**
++	 * Sets the destination path (declared for parity with other Loop types;
++	 * not observed read in OnInstall()'s traced path -- SFX paths are
++	 * resolved via the XML's orig_value/from attribute plus Source instead).
++	 * @param in Destination path.
++	 * @return void
++	 */
+ 	void pimSetDestPath(btkFSEntry &in){ Dest = (cStringT)in; }
+ };
+ 

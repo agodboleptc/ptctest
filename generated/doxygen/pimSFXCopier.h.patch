@@ -1,0 +1,155 @@
+--- a/pim_core/includes/pimSFXCopier.h
++++ b/pim_core/includes/pimSFXCopier.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   21-Jan-13 P-20-22   TWH   $$1    Created
+@@ -13,6 +13,29 @@
+ #include <threadlibcxx.h>
+ #include <pimSFXLoop.h>
+ 
++/**
++ * Process-wide singleton "owner" wrapper around pimSFXLoop, the install step
++ * that runs self-extracting-executable (SFX) installer payloads. One of 7
++ * near-identical Loop-owner wrapper singletons in pim_core. Structurally
++ * almost identical to pimMSICopier -- per this class's own header comment,
++ * "the self extracting executable is possibly running an MSI installer, so
++ * we ensure we are not also running an MSI installer."
++ *
++ * Locking contract: gated by the SAME external pimOKToRunMsiexec()/
++ * pimFreeMsiexec() functions (pim_util) that pimMSICopier uses -- not an
++ * independent mutex. Consequence: at most one of {an MSI install via
++ * pimMSICopier, an SFX install via this class} can be in flight
++ * process-wide at any moment; see pimMSICopier.h for the full mechanism
++ * (an in-process mutex plus a Windows Installer registry-key probe).
++ *
++ * Unlike pimCopier/pimShortcuts/pimRegEdit/pimServices/pimDownloader,
++ * Status() takes no output parameters -- no percent-complete or
++ * time-remaining is reported for SFX installs. Like pimMSICopier, Status()'s
++ * "done" branch does NOT delete the owned pimSFXLoop or release the gate --
++ * cleanup is caller-driven via Release()/Kill().
++ *
++ * Sole caller in this codebase: pimEntitlement.
++ */
+ class pimSFXCopier
+ {
+ private:
+@@ -36,12 +59,20 @@
+ 	pimSFXLoop *SFXLoop;
+ 
+ public:
++	/** @return The singleton instance, constructing it on first call. */
+ 	static pimSFXCopier& GetInstance();
+ 
+ protected:
+ 	pimSFXCopier();
+ 	~pimSFXCopier(){}
+ 
++	/**
++	 * Shared implementation behind SFXInstall(). Gated by pimOKToRunMsiexec()
++	 * (shared with pimMSICopier). Resolves dest via [LP], source via
++	 * cachedir (or [SOURCE] if NoDownloadSupport). Constructs and Execute()s
++	 * a pimSFXLoop asynchronously.
++	 * @return true if the gate was acquired and the install started; false if busy.
++	 */
+ 	int SFXCopy_low(pimXmlFile *);
+ 
+ private:
+@@ -58,46 +89,90 @@
+ 		Error
+ 	};
+ 
+-	// these use TRYLock 
++	// these use TRYLock
+ 	// return 1 if successfull and Download will happen
+ 	// return 0 if you should try again after a sleep
+-	// return negative if you should not try again 
+-	// 
++	// return negative if you should not try again
++	//
++	/**
++	 * Starts an SFX install. Non-blocking; delegates to SFXCopy_low().
++	 * @return 1 if started; 0 if the shared MSI/SFX gate is busy; negative on error.
++	 */
+ 	int SFXInstall(pimXmlFile *);
+ 
+ 	// After Download() starts returns call Status
+ 	// until IDLE state.
+ 	// OUTPUTS:
++	/**
++	 * Polls the install's progress; no percent/time-remaining is reported.
++	 * Does NOT delete the owned pimSFXLoop or release the gate on
++	 * completion -- call Release() explicitly.
++	 * @return Current CopyStatus.
++	 */
+ 	CopyStatus Status();
+ 
+ 	// Put into a hold after the current download file
+ 	// completes
++	/** Sets a caller-facing pause_flag reported by Status(); does not itself pause the install thread. */
+ 	void Pause();
+ 
+ 	// Resume Pause
++	/** Clears pause_flag. */
+ 	void Resume();
+ 
+-	// Cancel - set cancel flag to stop after current download file 
++	// Cancel - set cancel flag to stop after current download file
+ 	// and release/reset all flags so another thread could start
++	/**
++	 * Sets cancel_flag AND calls the owned pimSFXLoop's Cancel() directly.
++	 * Per pimSFXLoop's own contract, this cannot interrupt an
++	 * already-running child process -- only Kill() can. Does not null-check
++	 * the Loop pointer first.
++	 * @return void
++	 */
+ 	void Cancel();
+ 
+ 	// Release/reset all flags killing anything in progress
++	/**
++	 * If an install is in progress, kills the owned pimSFXLoop, deletes it,
++	 * and calls pimFreeMsiexec() to release the shared MSI/SFX gate.
++	 * @return void
++	 */
+ 	void Kill();
+ 
+ 	// Force Release - call if we have to release our use of the
+ 	// instance before we actually call "Execute"
++	/** Calls only pimFreeMsiexec(); does not touch the owned pimSFXLoop. */
+ 	void ForceRelease();
+ 
+ 	// Release - call after we check for errors/warnings.
+ 	//
++	/**
++	 * Deletes the owned pimSFXLoop (unconditionally) and calls
++	 * pimFreeMsiexec(). The only path that frees both after a normal
++	 * completion.
++	 * @return void
++	 */
+ 	void Release();
+ 
++	/** @return true if the owned pimSFXLoop reports errors. */
+ 	bool HasErrors();
+ 
++	/**
++	 * Proxies to the owned pimSFXLoop's GetErrors().
++	 * @param out Receives the accumulated error text.
++	 * @return void
++	 */
+ 	void GetErrors(btkString &out);
+ 
++	/** @return true if the owned pimSFXLoop reports warnings. */
+ 	bool HasWarnings();
+ 
++	/**
++	 * Proxies to the owned pimSFXLoop's GetWarnings().
++	 * @param out Receives the accumulated warning text.
++	 * @param remove_hyperlinks Strips hyperlink markup from the text if true.
++	 * @return void
++	 */
+ 	void GetWarnings(btkString &out, bool remove_hyperlinks = false);
+ 
+ };

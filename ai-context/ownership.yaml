@@ -1,0 +1,162 @@
+# Object ownership graph. Source of truth: docs/02_architecture_overview.md §5 (corrected),
+# docs/classes/{pimCopyLoop,pimSFXLoop,pimScriptLoop,pimShortcutLoop,pimServiceLoop,
+# pimPsfLoop,pimDownloadLoop,pimCopier,pimMSICopier,pimSFXCopier,pimShortcuts,pimRegEdit,
+# pimServices,pimDownloader}.md.
+#
+# MAJOR CORRECTION (2026-09, during full-depth documentation of the 6 remaining Loop
+# subclasses): the 7 "owner wrapper" classes were originally documented as
+# per-pimEntitlement owned objects (one owner, one owned Loop, per entitlement). That
+# was WRONG for all 7. Every one of them is a process-wide SINGLETON
+# (static pimXxx *OnlyXxx; static pimXxx& GetInstance();). pimEntitlement does not own
+# them -- it calls their singleton accessor and competes with every other
+# concurrently-installing entitlement for the same shared instance via a TryLock-based
+# busy/retry contract. This file reflects the corrected model.
+#
+# SECOND CORRECTION (2026-09, full-depth documentation of the 7 wrapper classes
+# themselves): the "TryLock-based busy/retry contract" above is NOT uniform across all
+# 7 -- see locking_contract_variants below. Most significantly, pimServices' own
+# xmlMutex.TryLock() does not actually serialize whole operations (see
+# docs/classes/pimServices.md Thread Safety) -- a confirmed use-after-free-class race.
+
+confirmed_directly_from_source:
+  # .cxx body read and GetInstance()/TryLock mechanism independently verified.
+  - pimCopier      # pim_core/pim_core_src/pimCopier.cxx -- reference implementation
+  - pimRegEdit     # pim_core/pim_core_src/pimRegEdit.cxx (verified earlier, docs/04_installation_flow.md §7)
+  - pimMSICopier   # pim_core/pim_core_src/pimMSICopier.cxx -- full read, docs/classes/pimMSICopier.md
+  - pimSFXCopier   # pim_core/pim_core_src/pimSFXCopier.cxx -- full read, docs/classes/pimSFXCopier.md
+  - pimShortcuts   # pim_core/pim_core_src/pimShortcuts.cxx -- full read, docs/classes/pimShortcuts.md
+  - pimServices    # pim_core/pim_core_src/pimServices.cxx -- full read, docs/classes/pimServices.md (see the early-unlock finding)
+  - pimDownloader  # pim_core/pim_core_src/pimDownloader.cxx (lines 1-213) -- full read, docs/classes/pimDownloader.md
+
+confirmed_from_header_only: []
+  # As of the 2026-09 owner-wrapper extension pass, all 7 are now confirmed directly
+  # from source -- this bucket is retained (empty) for historical continuity with the
+  # correction_history entries below, which refer to it.
+
+locking_contract_variants:
+  # Confirmed during the owner-wrapper extension pass: the "TryLock on an internal
+  # mutex, held for the full operation duration" pattern is the MAJORITY behavior but
+  # not universal. Three distinct variants exist:
+  - variant: "internal xmlMutex, held for full operation duration (correct/majority pattern)"
+    members: [pimCopier, pimShortcuts, pimRegEdit, pimDownloader]
+    release_points: "Status() on IsDone(), or Kill(), or (pimCopier only) Release()"
+  - variant: "shared EXTERNAL gate (pimOKToRunMsiexec()/pimFreeMsiexec() in pim_util), not an internal mutex at all"
+    members: [pimMSICopier, pimSFXCopier]
+    note: >
+      These two classes share the SAME gate function, so at most one of {an MSI
+      install, an SFX install} can run process-wide at a time -- not independently
+      serialized against each other the way the "internal xmlMutex" group's members
+      are. The gate is itself a static in-process thrMutex PLUS a Windows Installer
+      "...\Installer\InProgress" registry-key probe (pim_util/pim_util_src/pimMSI.cxx),
+      so it can also fail closed due to an MSI operation running outside this process.
+      Status()'s "done" branch does NOT release this gate for either class -- cleanup
+      is caller-driven via Release()/Kill(). See docs/classes/pimMSICopier.md and
+      docs/classes/pimSFXCopier.md.
+  - variant: "internal xmlMutex released IMMEDIATELY after starting the thread, not after completion (CONFIRMED BUG)"
+    members: [pimServices]
+    note: >
+      pimServices::Create_low() calls xmlMutex.Unlock() right after
+      ServiceLoop->Execute(), not from Status()/Kill() like its siblings. A second
+      Create()/Uninstall() call while the first pimServiceLoop is still running will
+      succeed at TryLock() and then `delete` the still-running Loop out from under its
+      own thread -- a use-after-free / destroy-while-running race. Currently latent
+      (no traced caller invokes pimServices concurrently) but live, reachable code.
+      See docs/classes/pimServices.md Thread Safety for the full analysis. This is the
+      single highest-severity finding of the entire documentation effort.
+
+cancel_propagation_variants:
+  # Confirmed during the owner-wrapper extension pass: Cancel()'s behavior also splits
+  # into two groups.
+  - variant: "Cancel() sets a flag AND calls the owned Loop's own Cancel() directly (unguarded against a NULL Loop pointer)"
+    members: [pimCopier, pimMSICopier, pimSFXCopier]
+  - variant: "Cancel() sets a flag ONLY -- does not stop the owned Loop; caller must compensate"
+    members: [pimShortcuts, pimRegEdit, pimServices, pimDownloader]
+    compensating_idiom: >
+      Every confirmed pimEntitlement call site for these 4 classes implements the same
+      idiom: on cancellation, call Cancel(), then poll Status() for up to KILL_COUNT
+      iterations waiting for the (still-running) Loop to reach CancelFlagSet naturally,
+      and only call Kill() if it has not finished by then. This is a deliberate,
+      repeated design pattern, not an overlooked bug at those call sites -- but any
+      NEW caller that calls Cancel() alone and assumes prompt stop would be wrong.
+
+ownership_graph:
+  pimSessionInfo:
+    owns:
+      - {target: pimEntitlement, cardinality: "N (EntitlementArray)"}
+      - {target: pimEntitlement, cardinality: "N (InstalledArray)"}
+      - {target: pimInterrogator, cardinality: 1}
+      - {target: pimLicenseSource, cardinality: "1 (ValidateLicenseSources)"}
+      - {target: pimSecurity, cardinality: "N (SecurityArray)"}
+    owned_by: "stack-local in each pim*Run function (pim/pim_src/pimTop.cxx)"
+
+  pimEntitlement:
+    owns_directly:
+      - {target: pimScriptLoop, lifecycle: "created/destroyed per InstallScripts()/rollback call, ~8 sites in pimEntitlement.cxx", pattern: transient_no_wrapper}
+      - {target: pimPsfLoop, lifecycle: "same pattern as pimScriptLoop", pattern: transient_no_wrapper}
+    does_not_own_calls_instead:
+      - {target: pimCopier, accessor: "pimCopier::GetInstance()", note: "TWO singleton instances exist: OnlyCopier (install) and OnlyUninstallCopier (uninstall/rollback), via GetInstance()/GetUninstallInstance() respectively -- independent serialization domains"}
+      - {target: pimMSICopier, accessor: "pimMSICopier::GetInstance()"}
+      - {target: pimSFXCopier, accessor: "pimSFXCopier::GetInstance()"}
+      - {target: pimShortcuts, accessor: "pimShortcuts::GetInstance()"}
+      - {target: pimRegEdit, accessor: "pimRegEdit::GetInstance()"}
+      - {target: pimServices, accessor: "pimServices::GetInstance()", note: "also carries a class-STATIC ServiceAction field (pimServices::serviceAction), set via setServiceAction() before Execute() -- an unusual out-of-band parameter-passing mechanism even relative to the other 6 singletons"}
+      - {target: pimDownloader, accessor: "pimDownloader::GetInstance()", note: "Download() takes a pimEntitlement& directly, unlike the other 6 singletons' plain pimXmlFile* signature"}
+    references_not_owned:
+      - {target: pimEntitlement, via: "PreRequisitesToHandle map", note: "these point at entries owned by pimSessionInfo's own arrays; DropPrerequisite() DELETES the object though — potential dangling pointer if referenced elsewhere"}
+      - {target: pimEntitlement, via: UpdateOfProduct, note: "points at the previously-installed entitlement being superseded"}
+    owned_by: "pimSessionInfo's EntitlementArray/InstalledArray"
+
+  singleton_wrapper_to_loop:
+    pattern: "constructs its one owned Loop instance lazily/fresh on each TryLock-acquired operation, deletes it when that operation finishes: XxxLoop = XNew pimXxxLoop(xmlPtr); ... delete XxxLoop; XxxLoop = NULL;"
+    concurrency_contract: "Xxx(xmlPtr) returns true/1 if the TryLock succeeded and the operation started; false/0 if another operation using the SAME singleton is already in progress (caller must sleep and retry); negative if the caller should not retry"
+    instances:
+      - {singleton: pimCopier, loop: pimCopyLoop, file: pim_core/pim_core_src/pimCopier.cxx, verified: direct_read}
+      - {singleton: pimMSICopier, loop: pimMSILoop, file: pim_core/pim_core_src/pimMSICopier.cxx, verified: direct_read}
+      - {singleton: pimSFXCopier, loop: pimSFXLoop, file: pim_core/pim_core_src/pimSFXCopier.cxx, verified: direct_read}
+      - {singleton: pimShortcuts, loop: pimShortcutLoop, file: pim_core/pim_core_src/pimShortcuts.cxx, verified: direct_read}
+      - {singleton: pimRegEdit, loop: pimRegEditLoop, file: pim_core/pim_core_src/pimRegEdit.cxx, verified: direct_read}
+      - {singleton: pimServices, loop: pimServiceLoop, file: pim_core/pim_core_src/pimServices.cxx, verified: direct_read, warning: "singleton's own lock does not actually serialize -- see locking_contract_variants"}
+      - {singleton: pimDownloader, loop: pimDownloadLoop, file: pim_core/pim_core_src/pimDownloader.cxx, verified: direct_read}
+    exceptions: "pimScriptLoop and pimPsfLoop have NO singleton wrapper -- pimEntitlement creates/destroys them directly, per call. These two Loop types CAN run concurrently across different entitlements; the 7 singleton-owned types are INTENDED to disallow this (only one operation of each type process-wide at a time) -- confirmed true for 6 of the 7; pimServices' own lock does not actually enforce it (see locking_contract_variants)."
+
+  concurrency_implication_summary: >
+    At any instant, across the ENTIRE PROCESS regardless of how many pimEntitlement
+    threads are simultaneously running: at most 1 install-copy, 1 uninstall-copy
+    (independent from install-copy), 1 MSI operation, 1 SFX operation, 1 shortcut
+    operation, 1 registry operation, 1 service operation, and 1 download can be
+    in flight at once. Script generation and PSF generation are the only two
+    Loop-driven operations with no such limit -- they scale with the number of
+    concurrently-installing entitlements.
+
+  pimXmlFile:
+    owned_by: "the class holding a pimXmlFile* (pimLoop::xmlPtr, pimSessionInfo::xmlPtr) — no confirmed deletion call site traced in this pass"
+    owns: [DOMDocument, XercesDOMParser, DOMTreeErrorReporter, "serializer objects (all internal, ctor/dtor not shown in header)"]
+
+not_owned_but_pointed_to:
+  - "imp_pim_dll.h's imported functions (external DLL, identity UNKNOWN) -- confirmed concrete consumer found: pimServiceLoop calls ginst_install_service/ginst_remove_service/ginst_is_service_installed/ginst_is_service_running directly"
+  - "the btk toolkit's objects generally (external, mostly value/RAII types not tracked as 'owned' in the PIM-specific sense)"
+
+correction_history:
+  - date: "2026-09 (Phase 7, during installation-flow trace)"
+    finding: "pimRegEdit is a singleton, not per-entitlement"
+    corrected_in: docs/04_installation_flow.md §7
+  - date: "2026-09 (extending Phase 5, documenting remaining 6 Loop subclasses)"
+    finding: "ALL 7 owner-wrapper classes are singletons, not just pimRegEdit -- the original Phase 2/5 assumption was wrong for pimCopier, pimMSICopier, pimSFXCopier, pimShortcuts, pimServices, pimDownloader too"
+    corrected_in: [docs/02_architecture_overview.md §5, docs/classes/pimCopyLoop.md, docs/modules/pim_core.md, this file]
+  - date: "2026-09 (full-depth documentation of the 7 owner-wrapper classes themselves)"
+    finding: >
+      The 7 singletons' locking/cancellation behavior is NOT uniform, contrary to the
+      prior correction's implicit assumption that "singleton" meant "identically
+      enforced." Confirmed: (1) pimServices' own TryLock does not serialize whole
+      operations -- it releases immediately after starting the thread, enabling a
+      use-after-free-class race if ever called concurrently; (2) pimMSICopier and
+      pimSFXCopier share ONE external gate (pimOKToRunMsiexec()/pimFreeMsiexec()),
+      not independent internal mutexes -- an MSI install and an SFX install cannot run
+      concurrently even though they are different singleton classes; (3) Cancel()
+      propagates into the owned Loop for only 3 of the 7 (pimCopier/pimMSICopier/
+      pimSFXCopier) -- the other 4 are flag-only, compensated for at the call site by
+      a cancel-then-grace-period-then-Kill() idiom; (4) pimRegEdit.h's own comment
+      ("these WAIT until they are able to start... and then return immediately") is
+      confirmed stale/wrong -- the implementation is non-blocking TryLock, matching
+      every sibling.
+    corrected_in: [docs/classes/pimCopier.md, docs/classes/pimMSICopier.md, docs/classes/pimSFXCopier.md, docs/classes/pimShortcuts.md, docs/classes/pimRegEdit.md, docs/classes/pimServices.md, docs/classes/pimDownloader.md, this file]

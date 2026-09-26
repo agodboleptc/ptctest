@@ -1,0 +1,275 @@
+--- a/pim_core/includes/pimShortcutLoop.h
++++ b/pim_core/includes/pimShortcutLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -17,6 +17,38 @@
+ #include <pimXmlFile.h>
+ #include <pimConvert.h>
+ 
++/**
++ * Install-step (pimLoop subclass) that creates and removes Windows shortcuts
++ * (.lnk files) at up to 5 locations -- Desktop, Start Menu, Programs Menu,
++ * Quick Launch, and the product's own install loadpoint.
++ *
++ * Responsibilities:
++ * - Iterate <SHORTCUT> elements; for each, read NAME/ICON/STARTINDIR/INDEX/
++ *   PATH/ARGS/WIN7APPID plus up to 5 location elements, each independently
++ *   toggleable via a create attribute.
++ * - Support BOTH directions within OnInstall(): create="Y" (re)creates a
++ *   shortcut; create="N" with a prior installed="Y" removes it -- this is
++ *   also how reconfigure-time shortcut toggling works, not just fresh
++ *   creation.
++ * - Skip a shortcut tied to a <PACKAGE> that is itself not selected for
++ *   install.
++ * - Preserve an existing shortcut's target/working-directory/arguments (but
++ *   NOT its icon/icon-index) when recreating over one that already exists.
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - pimConvert (property resolution).
++ * - External shell-link primitives pimCreateShellLink/pimGetShellLink
++ *   (presumed btk COM IShellLink/IPersistFile wrappers; not confirmed
++ *   against btk source, which is not included in this archive).
++ * - pim_util's pimGetStartMenuPrograms/pimGetDocuments for shell-folder
++ *   resolution.
++ *
++ * Owned by: pimShortcuts (pim_core/includes/pimShortcuts.h), a process-wide
++ * singleton (GetInstance()) -- NOT a per-entitlement object. Only one
++ * shortcut create/remove/reconfigure-cleanup operation can be in flight
++ * across the whole process at a time.
++ */
+ class pimShortcutLoop : public pimLoop
+ {
+ private:
+@@ -24,47 +56,198 @@
+ 	int is_reconfigure;
+ 	btkString StartInDir;
+ protected:
++	/**
++	 * Thread entry point; dispatches to OnInstall() or OnRollback().
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * Per <SHORTCUT> node: package-eligibility check, reads all child
++	 * fields, then for each of the 5 location types either creates (if
++	 * create="Y") or removes-if-previously-installed (if create="N" and
++	 * installed="Y").
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * Removes shortcuts previously marked installed="Y" across all location
++	 * types; behavior for the loadpoint location is affected by the
++	 * NoLPReconfigure XML property and the is_reconfigure flag.
++	 * @return void
++	 */
+ 	void OnRollback();
++
++	/**
++	 * Standard thread teardown.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
+-	bool CreateShellLink(const char *LinkPath, 
++	/**
++	 * Thin wrapper resolving a default working directory (via
++	 * pimGetDocuments) when none is supplied, then delegating to the
++	 * external pimCreateShellLink.
++	 *
++	 * @param LinkPath Destination .lnk file path.
++	 * @param CmdPath Target executable/command path.
++	 * @param _WorkDir Working directory, or NULL to use a resolved default.
++	 * @param IconPath Icon file path.
++	 * @param CmdArgs Command-line arguments for the shortcut.
++	 * @param IconIdx Icon index within IconPath.
++	 * @param Win7_appid_str Optional Windows 7+ AppUserModelID string.
++	 * @return true on success.
++	 */
++	bool CreateShellLink(const char *LinkPath,
+ 			const char *CmdPath,  const char *_WorkDir,
+-			const char *IconPath, const char *CmdArgs, 
++			const char *IconPath, const char *CmdArgs,
+ 			int IconIdx, const char *Win7_appid_str);
+ 
++	/**
++	 * @param path Directory to check.
++	 * @return true if the directory exists and contains no entries.
++	 */
+ 	bool IsEmptyDirectory(btkFSEntry &path);
+ 
+-	bool CreateShortcutProgramsmenu(btkString &programsmenu, btkString &name, 
++	/**
++	 * Builds "<StartMenuPrograms>/<programsmenu>/<name>.lnk", sanitizing
++	 * illegal filename characters (/ * | \) from name first, and preserving
++	 * an existing link's target/workdir/args if one is already present.
++	 *
++	 * @param programsmenu Subfolder name under the Programs Menu.
++	 * @param name Shortcut display name (used as the .lnk base filename).
++	 * @param icon Icon file path.
++	 * @param index Icon index (as a string, parsed internally).
++	 * @param path Target executable/command path.
++	 * @param args Command-line arguments.
++	 * @param win7appid Optional Windows 7+ AppUserModelID string.
++	 * @param allusers Whether to place the shortcut in the all-users Programs Menu.
++	 * @return true on success.
++	 */
++	bool CreateShortcutProgramsmenu(btkString &programsmenu, btkString &name,
+ 		btkString &icon, btkString &index, btkString &path, btkString &args,
+ 		btkString &win7appid, bool allusers);
+ 
++	/**
++	 * Removes the shortcut created by CreateShortcutProgramsmenu(), and its
++	 * subfolder if it becomes empty.
++	 *
++	 * @param programsmenu Subfolder name under the Programs Menu.
++	 * @param name Shortcut display name.
++	 * @param allusers Whether the shortcut was placed in the all-users Programs Menu.
++	 * @return true on success.
++	 */
+ 	bool RemoveShortcutProgramsmenu(btkString &programsmenu, btkString &name, bool allusers);
+ 
+-	bool CreateShortcutStartmenu(btkString &name, btkString &icon, 
++	/**
++	 * Same pattern as CreateShortcutProgramsmenu(), placed directly at the
++	 * Start Menu root (no subfolder).
++	 *
++	 * @param name Shortcut display name.
++	 * @param icon Icon file path.
++	 * @param index Icon index (as a string).
++	 * @param path Target executable/command path.
++	 * @param args Command-line arguments.
++	 * @param win7appid Optional Windows 7+ AppUserModelID string.
++	 * @param allusers Whether to place the shortcut in the all-users Start Menu.
++	 * @return true on success.
++	 */
++	bool CreateShortcutStartmenu(btkString &name, btkString &icon,
+ 		btkString &index, btkString &path, btkString &args,
+ 		btkString &win7appid, bool allusers);
+ 
++	/**
++	 * Removes the shortcut created by CreateShortcutStartmenu().
++	 *
++	 * @param name Shortcut display name.
++	 * @param allusers Whether the shortcut was placed in the all-users Start Menu.
++	 * @return true on success.
++	 */
+ 	bool RemoveShortcutStartmenu(btkString &name, bool allusers);
+ 
++	/**
++	 * Same pattern as the other location creators, but at an explicit
++	 * Loadpoint path rather than a shell-folder lookup.
++	 *
++	 * @param name Shortcut display name.
++	 * @param icon Icon file path.
++	 * @param index Icon index (as a string).
++	 * @param path Target executable/command path.
++	 * @param args Command-line arguments.
++	 * @param win7appid Optional Windows 7+ AppUserModelID string.
++	 * @param allusers Whether to place the shortcut in an all-users location.
++	 * @param Loadpoint The explicit destination directory.
++	 * @return true on success.
++	 */
+ 	bool CreateShortcutLoadPoint(btkString &name,btkString &icon, btkString &index, btkString &path, btkString &args, btkString &win7appid, bool allusers, btkString &Loadpoint);
+ 
++	/**
++	 * Removes the shortcut created by CreateShortcutLoadPoint().
++	 *
++	 * @param name Shortcut display name.
++	 * @param allusers Whether the shortcut was placed in an all-users location.
++	 * @param Loadpoint The destination directory the shortcut was created in.
++	 * @return true on success.
++	 */
+ 	bool RemoveShortcutLoadPoint(btkString &name, bool allusers, btkString &Loadpoint);
+ 
+-	bool CreateShortcutDesktop(btkString &name, btkString &icon, 
++	/**
++	 * Same pattern as the other location creators, placed on the Desktop.
++	 *
++	 * @param name Shortcut display name.
++	 * @param icon Icon file path.
++	 * @param index Icon index (as a string).
++	 * @param path Target executable/command path.
++	 * @param args Command-line arguments.
++	 * @param win7appid Optional Windows 7+ AppUserModelID string.
++	 * @param allusers Whether to place the shortcut on the all-users Desktop.
++	 * @return true on success.
++	 */
++	bool CreateShortcutDesktop(btkString &name, btkString &icon,
+ 		btkString &index, btkString &path, btkString &args,
+ 		btkString &win7appid, bool allusers);
+ 
+-	bool RemoveShortcutDesktop(btkString &name, bool allusers);
++	/**
++	 * Removes the shortcut created by CreateShortcutDesktop().
++	 *
++	 * @param name Shortcut display name.
++	 * @param allusers Whether the shortcut was placed on the all-users Desktop.
++	 * @return true on success.
++	 */
++	bool RemoveShortcutDesktop(btkString &name,  bool allusers);
+ 
+-	bool CreateShortcutQuickLaunch(btkString &name, btkString &icon, 
++	/**
++	 * Same pattern as the other location creators, placed in Quick Launch
++	 * (current-user only -- no allusers parameter, unlike the other
++	 * location-specific creators).
++	 *
++	 * @param name Shortcut display name.
++	 * @param icon Icon file path.
++	 * @param index Icon index (as a string).
++	 * @param path Target executable/command path.
++	 * @param args Command-line arguments.
++	 * @param win7appid Optional Windows 7+ AppUserModelID string.
++	 * @return true on success.
++	 */
++	bool CreateShortcutQuickLaunch(btkString &name, btkString &icon,
+ 		btkString &index, btkString &path, btkString &args,
+ 		btkString &win7appid);
+ 
++	/**
++	 * Removes the shortcut created by CreateShortcutQuickLaunch().
++	 *
++	 * @param name Shortcut display name.
++	 * @return true on success.
++	 */
+ 	bool RemoveShortcutQuickLaunch(btkString &name);
+ 
+ public:
++	/**
++	 * Constructs a pimShortcutLoop bound to the given XML content, with
++	 * do_rollback and is_reconfigure initialized to false.
++	 * @param ShortcutXMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimShortcutLoop(pimXmlFile *ShortcutXMLContent) : pimLoop(ShortcutXMLContent)
+ 	{
+ 		do_rollback = false;
+@@ -75,7 +258,20 @@
+ 	 * shortcuts with locations that have attrib "installed=Y" will be removed.
+ 	 * during reconfigure rollback only install=N + installed=Y will be removed.
+ 	 */
++	/**
++	 * Marks this Loop to run OnRollback() (remove installed="Y" shortcuts)
++	 * instead of OnInstall() when Execute()d.
++	 * @param tf New rollback-mode flag value.
++	 * @return void
++	 */
+ 	void SetRollback(bool tf) { do_rollback = tf; }
++
++	/**
++	 * Marks this Loop as running in a reconfigure context, affecting
++	 * loadpoint-shortcut handling during rollback.
++	 * @param tf New reconfigure-mode flag value.
++	 * @return void
++	 */
+ 	void SetReconfigure(bool tf) { is_reconfigure = tf; }
+ };
+ 

@@ -1,0 +1,154 @@
+--- a/pim_core/includes/pimPsfLoop.h
++++ b/pim_core/includes/pimPsfLoop.h
+@@ -1,10 +1,10 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+   26-Nov-12 P-20-18   TWH   $$2    Add ReadPsfUserData
+-  26-Oct-15 P-30-19   MTH   $$3   don't delete the old psf 
++  26-Oct-15 P-30-19   MTH   $$3   don't delete the old psf
+ \*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/
+ #ifndef PIMPSFLOOP_H
+ #define PIMPSFLOOP_H
+@@ -13,22 +13,124 @@
+ #include <pimXmlFile.h>
+ #include <pimConvert.h>
+ 
++/**
++ * Install-step (pimLoop subclass) that generates and removes PSF files --
++ * per-product license-configuration files paired with a .bat launcher --
++ * from the same <INCLUDE>/<BODY> template composition mechanism used by
++ * pimScriptLoop. (The literal expansion of the "PSF" acronym is UNKNOWN;
++ * not stated anywhere in this archive.)
++ *
++ * Responsibilities:
++ * - Iterate <PSF> elements and, for each, locate a named template in a
++ *   separate template XML document, composing content from its
++ *   <INCLUDE>/<BODY> children and resolving property placeholders.
++ * - Before overwriting an existing PSF file, read and preserve any lines
++ *   found after a literal "USER - PSF" marker comment (ReadPsfUserData()),
++ *   re-appending them to the newly generated file so manual user
++ *   customizations survive regeneration. If that marker is missing or
++ *   altered, preservation silently fails with no error.
++ * - Honor a one-time "PTC_SUPPRESS_LMLIC_ENV" opt-out embedded in preserved
++ *   user data, suppressing the same line pattern from newly generated
++ *   content on every future regeneration.
++ * - Distinguish two removal modes: RemovePsf deletes both the PSF file and
++ *   its .bat wrapper; RemoveLogicalPsf deletes ONLY the .bat wrapper,
++ *   deliberately leaving the PSF file itself on disk (source comment:
++ *   "don't delete file physically").
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - pimConvert (property resolution).
++ * - LocateXMLFile (resolves the template XML document).
++ *
++ * Ownership: like pimScriptLoop, this is one of only 2 of 9 Loop subclasses
++ * with NO singleton wrapper -- pimEntitlement creates and destroys it
++ * directly, per call. PSF generation for different entitlements can
++ * therefore run fully concurrently.
++ */
+ class pimPsfLoop : public pimLoop
+ {
+ private:
+ 	int do_rollback;
+ protected:
++	/**
++	 * Thread entry point; dispatches to OnInstall() or OnRollback() based on
++	 * do_rollback.
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * For each eligible <PSF> node: resolves/loads the referenced template
++	 * document, calls CreatePsf(), and on success marks installed="Y".
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * For each <PSF installed="Y"> node: calls RemovePsf() (or
++	 * RemoveLogicalPsf(), per the node's own configuration) and clears the
++	 * installed attribute on success.
++	 * @return void
++	 */
+ 	void OnRollback();
++
++	/**
++	 * Standard thread teardown.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
++	/**
++	 * Finds the <PSF name="name"> node inside templateXML, concatenates its
++	 * <INCLUDE>/<BODY> content, resolves placeholders via Converter, reads
++	 * and preserves any pre-existing "USER - PSF" marked user data at dest
++	 * via ReadPsfUserData() before overwriting, and writes the composed
++	 * file plus its .bat launcher wrapper.
++	 *
++	 * @param name The PSF definition's name, matched against the template.
++	 * @param dest Output PSF file path (may contain unresolved placeholders).
++	 * @param templateXML The loaded template document containing the named PSF.
++	 * @param Converter Resolves property placeholders in content and dest.
++	 * @return true if the PSF file and its .bat wrapper were written successfully.
++	 */
+ 	bool CreatePsf(const char *name, const char *dest, pimXmlFile *templateXML, pimConvert *);
++
++	/**
++	 * Deletes both the PSF file at dest and its accompanying .bat wrapper.
++	 *
++	 * @param dest PSF file path to remove.
++	 * @param Converter Resolves property placeholders in dest, or NULL to use dest as-is.
++	 * @return true on success.
++	 */
+ 	bool RemovePsf(const char *dest, pimConvert *);
++
++	/**
++	 * Deletes ONLY the .bat wrapper associated with dest, deliberately
++	 * leaving the PSF file itself on disk.
++	 *
++	 * @param dest PSF file path whose .bat wrapper should be removed.
++	 * @param Converter Resolves property placeholders in dest, or NULL to use dest as-is.
++	 * @return true on success.
++	 */
+ 	bool RemoveLogicalPsf(const char *dest, pimConvert *);
++
++	/**
++	 * Reads file and, if a literal "USER - PSF" marker comment line is
++	 * found, captures everything after it into out for later
++	 * re-appending by CreatePsf().
++	 *
++	 * @param file Existing PSF file path to scan.
++	 * @param out Receives the preserved user-data content, if any.
++	 * @return true if user data was found and captured.
++	 */
+ 	bool ReadPsfUserData(const char *file, btkString &out);
+-	
++
+ public:
++	/**
++	 * Constructs a pimPsfLoop bound to the given XML content, with
++	 * do_rollback initialized to false.
++	 * @param PsfXMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimPsfLoop(pimXmlFile *PsfXMLContent) : pimLoop(PsfXMLContent)
+ 	{
+ 		do_rollback = false;
+@@ -37,6 +139,12 @@
+ 	/*
+ 	 * scripts that have attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Marks this Loop to run OnRollback() (remove installed="Y" PSF files)
++	 * instead of OnInstall() when Execute()d.
++	 * @param tf New rollback-mode flag value.
++	 * @return void
++	 */
+ 	void SetRollback(bool tf) { do_rollback = tf; }
+ };
+ 

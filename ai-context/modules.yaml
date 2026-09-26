@@ -1,0 +1,118 @@
+# Per-module structured summary. Source of truth: docs/modules/*.md
+# Fields per module: purpose, responsibilities, dependencies, consumers,
+# owned_components, failure_modes, extension_points, risks, key_files.
+
+modules:
+  pim:
+    doc: docs/modules/pim.md
+    purpose: "DLL exporting top-level Run entry points; process-wide init/teardown"
+    responsibilities:
+      - "pimInstallerRun / pimFrictionlessTrialRun / pimRenewLicenseRun (pim/pim_src/pimTop.cxx)"
+      - "Process-wide init: Xerces (pimXmlInit), browser/credentials (pimBrowserInit), UI (pimUIInit), general (pimGeneralInit)"
+      - "CLI argument parsing and global run-mode state (pimGeneralInit.cxx)"
+      - "Process-lifetime error-code stack (pimExit.cxx)"
+    depends_on: [pim_core, pim_ui, pim_util]
+    consumers: ["external launcher EXEs (not in archive)"]
+    owned_components: ["init state flags", "CLI-derived global state", "error stack"]
+    key_files:
+      - pim/pim_src/pimTop.cxx      # 3284 lines
+      - pim/pim_src/pimGeneralInit.cxx  # 726 lines
+      - pim/pim_src/pimUIInit.cxx
+      - pim/pim_src/pimXmlInit.cxx
+      - pim/pim_src/pimBrowserInit.cxx
+      - pim/pim_src/pimExit.cxx
+      - pim/includes/exp_pim_dll.h
+      - pim/includes/imp_pim_dll.h
+    failure_modes:
+      - {condition: "Xerces init throws", result: "PIM_INITIALIZE_XML_ERROR"}
+      - {condition: "general init throws", result: "PIM_INITIALIZE_LIBRARY_ERROR"}
+      - {condition: "browser init throws", result: "PIM_INITIALIZE_COMMS_ERROR"}
+      - {condition: "UI init fails", result: "PIM_INITIALIZE_UI_ERROR; skips pimUITerminate on shutdown"}
+      - {condition: "no PTC.com connectivity + NO_PTCDOTCOM_PROPERTY set", result: "PIM_PTC_IT_COMMS_ERROR"}
+      - {condition: "32/64-bit platform mismatch", result: "PIM_GENERAL_XML_ERROR pushed but function returns unlisted literal -104 (inconsistency, see docs/10_error_handling.md §2.2)"}
+    extension_points:
+      - "New CLI flag: extend pimCommandLineArgs' if/else chain"
+      - "New run mode: new DLLEXPORTAPI function following the init->dialog->teardown skeleton"
+    risks:
+      - "pimTop.cxx: 3284 lines, 149 revision entries 2011-2026, covers 3 flows in one file"
+      - "Global mutable static state in pimGeneralInit.cxx: not re-entrant"
+
+  pim_core:
+    doc: docs/modules/pim_core.md
+    purpose: "Install engine and shared runtime state"
+    responsibilities:
+      - "XML processing (pimXmlFile)"
+      - "Session/product model (pimSessionInfo, pimEntitlement)"
+      - "Install-step execution (pimLoop + 9 concrete Loop subclasses)"
+      - "Prerequisite graph"
+      - "Discovery (pimInterrogator, pimLocate, pimGetAvailable*)"
+      - "Selection managers (pimPackageMgr, pimPlatformMgr, pimLanguageMgr)"
+      - "Logging and localized messages (pimLog, pimMessage)"
+    depends_on: [pim_util]
+    consumers: [pim, pim_ui]
+    owned_components:
+      - "pimSessionInfo owns N pimEntitlement + 1 pimInterrogator"
+      - "pimEntitlement owns pimCopier/pimMSICopier/pimSFXCopier/pimShortcuts/pimServices/pimDownloader (1 Loop each) + creates pimScriptLoop/pimPsfLoop transiently"
+    key_files:
+      - pim_core/pim_core_src/pimEntitlement.cxx   # 7649 lines, largest file in codebase
+      - pim_core/pim_core_src/pimRegEditLoop.cxx    # 742 lines
+      - pim_core/pim_core_src/pimCopyLoop.cxx        # edited this session (CAB->ZIP)
+      - pim_core/pim_core_src/pimLoop.cxx            # 248 lines
+      - pim_core/pim_core_src/pimXmlFile.cxx
+      - pim_core/pim_core_src/pimLog.cxx             # 173 lines
+      - pim_core/pim_core_src/pimPrerequisite.cxx    # 400 lines
+      - pim_core/pim_core_src/pimMSILoop.cxx         # 1106 lines
+      - pim_core/messages/<11 languages>/pim.msg
+    failure_modes:
+      - {condition: "XML parse error", result: "pimHitError(PIM_GENERAL_XML_ERROR); caller aborts current op"}
+      - {condition: "archive extraction failure", result: "errors array appended; caller logs and surfaces to UI"}
+      - {condition: "prerequisite unsatisfied after claimed done, hard prereq", result: "pimHitError(PIM_PREQUISITE_NOT_SATISFIED); install aborts"}
+      - {condition: "thread crash in a Loop's OnExecute", result: "pimLoop::OnUnhandled -> btkCrash -> process terminates"}
+    extension_points:
+      - "New Loop subclass following the pimLoop pattern"
+      - "New prerequisite rule: add a check fn + dispatcher branch in pimPrerequisite.cxx"
+    risks:
+      - "pimEntitlement.cxx (7649 lines): highest blast-radius file in the codebase"
+      - "Session property bag has no static schema (string-keyed, no compile check)"
+      - "pimScriptLoop/pimPsfLoop lack the owner-wrapper pattern the other 7 Loop types use"
+      - "pimRegEditLoop.cxx performs live registry writes with XML-driven root key selection"
+
+  pim_ui:
+    doc: docs/modules/pim_ui.md
+    purpose: "Dialog/presentation layer on a custom (non-MFC) UI toolkit"
+    responsibilities:
+      - "pimInstallMgrDlg: main product-selection/progress dialog + ~10 nested custom widget classes"
+      - "Alternate top-level dialogs: pimFrictionlessTrialDlg, rpimDlg, upimDlg, pimsilentDlg"
+      - "~15 supporting dialogs (auth, browser, EULA, license get, insufficient space, etc.)"
+    depends_on: [pim_core, pim_util]
+    consumers: [pim]
+    key_files:
+      - pim_ui/includes/pimInstallMgrDlg.h
+      - pim_ui/pim_ui_src/pimInstallMgrDlg.cxx
+      - pim_ui/pim_ui_src/pimInstallMgrActions.cxx
+      - pim_ui/pim_ui_src/pim*Refresh.cxx   # headerless out-of-line member function files
+    coverage_note: "lighter pass than pim/pim_core/pim_util; individual dialog .cxx files not read"
+    risks:
+      - "pimInstallMgrDlg.h bundles ~10+ widget classes + the main dialog class in one header"
+      - "UI logic split across a header-declared class and several headerless .cxx files"
+
+  pim_util:
+    doc: docs/modules/pim_util.md
+    purpose: "Lowest-level OS/platform/archive/MSI/license utilities"
+    responsibilities:
+      - "CAB archive handling (pimCab.h/.cxx, pimFdi32.h) — legacy path, pre-this-session"
+      - "MSI wrapper (pimMSI.h/.cxx)"
+      - "FlexNet Licensing queries (pimFLEXnet.h/.cxx)"
+      - "Add/Remove Programs + PTC install-record registry bookkeeping (pimRegisterProduct.h/.cxx)"
+      - "String obfuscation (pimScramble.h/.cxx)"
+      - "OS/platform detection (pimWindows.h/.cxx)"
+    depends_on: []
+    consumers: [pim_core, pim]
+    key_files:
+      - pim_util/includes/pimCab.h        # confirmed pimCopyCabinetArch/pimListCabinetContent signatures
+      - pim_util/pim_util_src/pimRegisterProduct.cxx  # 678 lines
+      - pim_util/includes/pimMSI.h
+      - pim_util/includes/pimFLEXnet.h
+    risks:
+      - "pimScramble's obfuscation is binary/string-scan resistance only, not real security"
+      - "This module is the most likely place for platform/vendor-API version breakage"

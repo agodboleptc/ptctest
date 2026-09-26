@@ -1,0 +1,21 @@
+%% pimEntitlement::OnExecute Dispatch (from docs/04_installation_flow.md §1)
+%% Source: docs/04_installation_flow.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+flowchart TD
+    Start([OnExecute]) --> PrereqGate{"!in_reconfigure && !do_rollback\nAND HasPrerequisite() && !HasPrerequisitesInstallSucceeded()?"}
+    PrereqGate -- yes --> ReturnEarly1([return -- wait for prerequisites])
+    PrereqGate -- no --> ReconfigGate{in_reconfigure?}
+    ReconfigGate -- yes --> InitSim1[InitSimulateLicenses if declared] --> OnReconfigureCall[OnReconfigure] --> ReturnEarly2([return])
+    ReconfigGate -- no --> MSIPathFix["MSI 64-bit ProgramFiles path fixup\n(if x86 MSI on x64 install path)"]
+    MSIPathFix --> HybridUpdateFix["IsMSIHybrid && AreWeAnUpdate: set [LP]=[MSIINSTALLPATH]"]
+    HybridUpdateFix --> UpdateGate{UpdateOfProduct != NULL?}
+    UpdateGate -- yes --> OnUpdateCall["OnUpdate(update_cdsections)"]
+    UpdateGate -- no --> InitCmds["pimCommandMgr::InitCommand(NULL) + InitSimulateLicenses if declared"]
+    OnUpdateCall --> RollbackGate
+    InitCmds --> RollbackGate{do_rollback?}
+    RollbackGate -- no --> OnInstallCall[OnInstall]
+    RollbackGate -- "do_rollback OR do_install_rollback" --> OnRollbackCall["OnRollback(do_install_rollback)"]
+    OnInstallCall --> RollbackGate2{do_rollback OR do_install_rollback?}
+    RollbackGate2 -- yes --> OnRollbackCall
+    RollbackGate2 -- no --> Done([done])

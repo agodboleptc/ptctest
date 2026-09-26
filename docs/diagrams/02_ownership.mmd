@@ -1,0 +1,18 @@
+%% Ownership Graph (from docs/02_architecture_overview.md §5)
+%% Source: docs/02_architecture_overview.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+%% CORRECTED 2026-09: the 7 owner-wrapper classes are process-wide singletons, not per-entitlement owned objects (except pimScriptLoop/pimPsfLoop which have no wrapper at all).
+
+graph TD
+    SessionInfo[pimSessionInfo] -->|owns array| Entitlement[pimEntitlement N instances]
+    SessionInfo -->|owns| Interrogator[pimInterrogator]
+    Entitlement -->|calls, does not own| Copier["pimCopier (SINGLETON)"] -->|owns 1 at a time| CopyLoop[pimCopyLoop]
+    Entitlement -->|calls, does not own| MSICopier["pimMSICopier (SINGLETON)"] -->|owns 1 at a time| MSILoop[pimMSILoop]
+    Entitlement -->|calls, does not own| SFXCopier["pimSFXCopier (SINGLETON)"] -->|owns 1 at a time| SFXLoop[pimSFXLoop]
+    Entitlement -->|calls, does not own| Shortcuts["pimShortcuts (SINGLETON)"] -->|owns 1 at a time| ShortcutLoop[pimShortcutLoop]
+    Entitlement -->|calls, does not own| RegEdit["pimRegEdit (SINGLETON)"] -->|owns 1 at a time| RegEditLoop[pimRegEditLoop]
+    Entitlement -->|calls, does not own| Services["pimServices (SINGLETON)"] -->|owns 1 at a time| ServiceLoop[pimServiceLoop]
+    Entitlement -->|calls, does not own| Downloader["pimDownloader (SINGLETON)"] -->|owns 1 at a time| DownloadLoop[pimDownloadLoop]
+    Entitlement -.creates transiently, owns directly.-> ScriptLoop[pimScriptLoop]
+    Entitlement -.creates transiently, owns directly.-> PsfLoop[pimPsfLoop]
+    Entitlement -->|prerequisite refs, not ownership| OtherEntitlement[other pimEntitlement instances]

@@ -1,0 +1,90 @@
+--- a/pim_ui/includes/rpimDlg.h
++++ b/pim_ui/includes/rpimDlg.h
+@@ -20,39 +20,82 @@
+ #define RESET_PWD_LINK "https://www.ptc.com/appserver/common/account/password.jsp"
+ 
+ 
++/**
++ * @brief The UI for pim_re.exe's "Renew License" flow: prompts for account
++ *        credentials, shows the resolved host ID (node-locked or license-
++ *        server, from NODE_LOCKED_LICENSE_PATH_PROPERRTY), and drives a
++ *        background FLEXnet license-renewal worker (pimPTCRenewLicenseGet).
++ *
++ * The closest sibling in this codebase to pimFrictionlessTrialDlg (see that
++ * class's own doc) -- structurally near-identical and 3 years older (created
++ * 2015 vs. 2018), strongly suggesting pimFrictionlessTrialDlg was cloned
++ * from this class (itself likely a partial copy of pimAuthDlg's original
++ * template -- see RetryMsg below).
++ *
++ * IMPORTANT COMPARISON: Display() here is CORRECT (always calls
++ * uiDialog::Activate()) -- unlike pimFrictionlessTrialDlg::Display(), which
++ * has a confirmed bug where its in-house-mode branch blocks on Sleep(60000)
++ * instead. Comparing the two confirms that bug is a genuine defect, not an
++ * inherent limitation of this shared dialog design. See
++ * docs/classes/rpimDlg.md Risk Analysis for full detail.
++ *
++ * CONFIRMED DEAD CODE: SetURL()/the URL member, GetAuth(), and the
++ * `rDlg` static self-pointer (set in the constructor, no accessor ever
++ * written) all have zero confirmed callers anywhere in this archive. The
++ * RetryMsg member is declared but never read or written anywhere in this
++ * class (contrast with pimAuthDlg, which fully wires RetryMsg through to a
++ * visible label). Also confirmed: the same dead reentrancy guard pattern
++ * (a static in_timer checked but never set true) found in
++ * pimFrictionlessTrialDlg::OnTimerExpired().
++ */
+ class rpimDlg : public uiDialog
+ {
+ private:
+ 	// uiObjects
+ 	uiLabel UserNameLabel;
+-	uiInputPanel UserNameInput;	
++	uiInputPanel UserNameInput;
+ 	uiLabel PwLabel;
+-	uiInputPanel PwInput;	
++	uiInputPanel PwInput;
+ 	uiLabel EmailLabel;
+ 	uiPushButton ResetPWButton;
+ 	uiPushButton RenewLicenseButton;
+ 	uiPushButton ContinueButton;
+ 	uiLabel HostIdValueLabel;
+ 	uiLabel ProcessingLabel;
+-	uiTimer LicenseGenerateTimer;
++	uiTimer LicenseGenerateTimer;  ///< Correctly polled via Display()'s Activate() call -- see class comment.
+ public:
+ 	rpimDlg();
+ 	~rpimDlg();
++	/// Idempotent; resolves node-locked-vs-server renewal mode from
++	/// NODE_LOCKED_LICENSE_PATH_PROPERRTY. No error path if the property
++	/// matches neither expected pattern -- see class comment / doc Risk Analysis #4.
+ 	bool Initialize();
+ 	void SetSessionInfoFile(pimSessionInfo *S) { SessionInfo = S; }
++	/// CORRECT: always calls uiDialog::Activate() -- contrast with
++	/// pimFrictionlessTrialDlg::Display()'s confirmed Sleep(60000) bug.
+ 	bool Display();
++	/// Starts the background pimPTCRenewLicenseGet worker and arms LicenseGenerateTimer.
+ 	void RenewLiceneGenerate();
++	/// CONFIRMED DEAD: zero callers anywhere in this archive.
+ 	void SetURL(const wchar_t *);
++	/// CONFIRMED DEAD: zero callers anywhere in this archive (contrast with
++	/// pimAuthDlg::GetAuth(), which IS called on its own instance).
+ 	bool GetAuth(btkWString &username, btkWString &password);
+ private:
+ 	bool initialized;
+ 	pimSessionInfo *SessionInfo;
++	/// CONFIRMED ACTIVE (contrast with pimFrictionlessTrialDlg::Refresh(),
++	/// which is confirmed dead): called from OnInputPanelInput() to gate
++	/// RenewLicenseButton's sensitivity on both credential fields being non-empty.
+ 	void Refresh();
+-	btkWString URL, User, Password, RetryMsg;
+-	
++	btkWString URL, User, Password, RetryMsg;  ///< URL and RetryMsg are confirmed dead; User/Password are live.
++
+ protected:
+ 	bool OnInputPanelInput(uiInputPanel &);
+ 	bool OnPushButtonActivate(uiPushButton &);
++	/// The poll callback for LicenseGenerateTimer, reliably invoked here
++	/// (unlike pimFrictionlessTrialDlg's equivalent). Contains a confirmed-dead
++	/// reentrancy guard (a static in_timer that is checked but never set true).
+ 	uiTimerOp OnTimerExpired (uiTimer&, void *user_data);
+ 	bool OnClose();
+ };

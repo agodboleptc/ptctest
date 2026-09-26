@@ -1,0 +1,97 @@
+%% pimInstallerRun Sequence (from docs/03_application_startup.md §3)
+%% Source: docs/03_application_startup.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+sequenceDiagram
+    participant EXE as pim.exe (external, not in archive)
+    participant Top as pimTop.cxx::pimInstallerRun
+    participant Xml as pimXmlFile (Xerces DOM)
+    participant SI as pimSessionInfo
+    participant Ent as pimEntitlement (per product)
+    participant Dlg as pimInstallMgrDlg
+
+    EXE->>Top: pimInstallerRun(argc, argv)
+    Top->>Top: btki18nSetup(); pimXmlInit(); pimCommandLineArgs(); pimGeneralInit(); pimBrowserInit(); InitLog(); pimUIInit(false)
+    Top->>Top: pimWindowsPathTest()
+    Top->>Top: LocatePhysicalImage(pimImageLocation)
+    alt physical media image found
+        Top->>Xml: parse image root XML, scan <FAMILY>/<ENTITLEMENT> nodes
+        Xml-->>Top: WGM family detection -> pimSetProductMode(PIM_WGM_MODE) if matched
+    end
+    Top->>SI: construct pimSessionInfo
+    Top->>SI: SetProperty(EXERUN_PROPERTY, argv[0]); SetProperty(LICENSED_PROPERTY,"N")
+    Top->>SI: FoundPreviousSessionInfoFile() (checked, load path currently disabled by `if (0)`)
+    alt no physical image (network/PTC.com path)
+        Top->>SI: TestCommunicationToPTC() (skipped if in reconfigure mode)
+    else physical image present
+        Top->>Top: skip TestCommunicationToPTC (log only)
+    end
+    Top->>SI: SetProperty(PLATFORM_PROPERTY, LANGUAGE_PROPERTY, MSIVERSION_PROPERTY via btkDlmGetImageVersionW("msi.dll"))
+    alt physical media image
+        Top->>Top: enumerate *.xml files under image, filter by image.xml reference list, trial-mode, LimitToThisList, FLEX admin/lmgrd rules
+        loop for each candidate xml
+            Top->>SI: AddEntitlement(file)
+            SI-->>Top: pimEntitlement* created/registered on success
+            Top->>Ent: SetQualityAgent(true) / SetQualityAgentRequired(...) as applicable
+            opt UI language != file language
+                Top->>Top: pimTranslateMgr::TranslateFrom(translation file)
+            end
+        end
+        Top->>Top: derive product mode from family flags found (FlexOnly/Schematics/Mathcad/WGM/ARPlugin/CreoHelp/MKS)
+        Top->>Ent: SetInstallMe(true/false) per mode default, for every loaded entitlement
+        Top->>Xml: re-parse image XML for SHIPCODE/DATECODE/LABEL/BANNER/PLATFORM -> SessionInfo properties
+        opt platform bitness mismatch detected (GetSystemWow64DirectoryA probe)
+            Top->>Top: show blocking error dialog (uiMessage), pimHitError(PIM_GENERAL_XML_ERROR), return -104
+        end
+    else network install / reconfigure
+        Top->>SI: SetProperty(MEDIA_PROPERTY,"N")
+        alt reconfigure mode
+            Top->>Top: detect FlexOnly via installed FLEX_LMGRD_XML_INSTALLED / FLEX_ADMIN_XML_INSTALLED under "pim/xml"
+        else fresh network install
+            opt no PTC.com comms and NO_PTCDOTCOM_PROPERTY set
+                Top-->>EXE: return PIM_PTC_IT_COMMS_ERROR
+            end
+        end
+        opt Mathcad mode
+            Top->>SI: SetSecurity(pimMediaProductionUrl, pimPrimeAuthName, pimPrimeAuthPass)
+        end
+        Top->>SI: read SHIPCODE/VERSION from existing session XML node (pimPIMSETUP)
+    end
+    Top->>Top: pimQueryCPUIdAtIndex -> SessionInfo.SetProperty(HOSTID1_PROPERTY, ...)
+    Top->>SI: Save()
+    Top->>Dlg: construct pimInstallMgrDlg; SetSessionInfoFile(&SessionInfo)
+    Top->>Dlg: Initialize()
+    alt Initialize() succeeded
+        Top->>SI: GetInterrogator()->GetKnownLicenseSources[For](...)
+        loop for each known license source
+            Top->>Top: triad-partner consolidation (pimGetTriadParterNames/pimTrimFlexPartner/pimGetTriadAddress)
+            Top->>SI: AddLicenseSourceNew(row, entry)
+            Top->>Top: detect if source is local host -> local_flex_source
+        end
+        Top->>SI: StartValidateThread()
+        opt local flex source detected
+            Top->>Top: checkForLocalFlexServerExistence(&SessionInfo, idx, source)
+        end
+        opt not trial/school/beta/WGM/Mathcad/FlexOnly
+            Top->>Top: scan saved *_license.dat files under "PTC/Licensing" appdata for locked/valid trial licenses -> AddLicenseSource
+        end
+        Top->>Dlg: Refresh()
+        Top->>Dlg: Display()  %% blocks until user completes/cancels the UI
+        Top->>SI: Save()
+    else Initialize() failed
+        Top->>Top: pimHitError(PIM_INITIALIZE_UI_ERROR)
+    end
+    Top->>SI: for each entitlement: Wait()  %% join every per-product install thread
+    opt SessionInfo.GetIsUpdateValue()
+        Top->>Top: pimUpdateUtilityAppList(PIM_ADD_FOR_SVCS / PIM_ADD_FOR_QAGENT, installPath)
+    end
+    opt pimGetInstallPathForUtility() succeeds
+        Top->>Top: pimWriteUUIDForUtility(...)
+    end
+    Top->>Top: LG_INFO(pimLogGoodbye)
+    Top->>SI: PrepareForShutdown()
+    opt last error != PIM_INITIALIZE_UI_ERROR
+        Top->>Top: pimUITerminate(true)
+    end
+    Top->>Top: ptc_exit_run(1); btki18nCleanup()
+    Top-->>EXE: return pimGetLastError()

@@ -1,0 +1,68 @@
+# Dependency graph: internal (module/class level) and external.
+# Source of truth: docs/02_architecture_overview.md §4, docs/modules/*.md, docs/classes/*.md.
+
+internal_module_dependencies:
+  pim: [pim_core, pim_ui, pim_util]
+  pim_ui: [pim_core, pim_util]
+  pim_core: [pim_util]
+  pim_util: []
+
+internal_class_dependencies:
+  pimEntitlement:
+    inherits: [pimLoop]
+    depends_on: [pimSessionInfo, pimXmlFile, pimConvert, pimCopier, pimServices]
+    creates: [pimScriptLoop, pimPsfLoop]
+    referenced_by_pointer_not_owned: [pimEntitlement]   # prerequisite graph edges
+  pimSessionInfo:
+    depends_on: [pimXmlFile, pimInterrogator, pimLicenseSource, pimConvert]
+    owns_arrays_of: [pimEntitlement, pimSecurity]
+  pimCopyLoop:
+    inherits: [pimLoop]
+    depends_on: [btkUnzip, pimConvert]
+    depends_on_legacy_unused: ["pim_util pimCab.h's pimCopyCabinetArch/pimListCabinetContent (declared, no longer called from this file)"]
+    owned_by: [pimCopier]
+  pimXmlFile:
+    depends_on: [xerces_c]
+  pimLoop:
+    inherits: [thrThread]   # external btk
+    depends_on: [pimXmlFile]
+
+external_dependencies:
+  - name: btk_toolkit
+    category: foundational
+    provides: [btkString, btkFSEntry, btkFSList, btkWString, thrThread, thrMutex, thrRWLock, thrSemaphore, btkLogManager, btkXArray, btkMap, dsXArray, "ui* dialog widget classes"]
+    source_in_archive: PARTIAL   # only btkunzip.h/.cxx supplied, separately, this session
+    used_by_modules: [pim, pim_core, pim_ui, pim_util]
+  - name: xerces_c
+    category: xml_parsing
+    provides: [DOMDocument, DOMNode, DOMNodeList, DOMElement, XercesDOMParser, DOMLSSerializer]
+    used_by_modules: [pim_core]
+    used_by_classes: [pimXmlFile]
+  - name: libzip
+    category: archive
+    accessed_via: btk's btkUnzip class
+    used_by_classes: [pimCopyLoop]
+  - name: windows_installer_msi
+    category: installer_tech
+    used_by_classes: [pimMSILoop, "pim_util's pimMSI"]
+  - name: windows_cabinet_fdi
+    category: archive_legacy
+    used_by_files: ["pim_util/pim_util_src/pimCab.cxx (still present, no longer called from pimCopyLoop)"]
+  - name: flexnet_licensing
+    category: licensing
+    used_by_files: ["pim_util/pim_util_src/pimFLEXnet.cxx"]
+  - name: win32_api
+    category: os
+    used_by_files: ["pim_core/pim_core_src/pimRegEditLoop.cxx", "pim_util/pim_util_src/pimRegisterProduct.cxx", "pim_util/pim_util_src/pimWindows.cxx"]
+  - name: unnamed_ptc_platform_dll
+    category: internal_ptc
+    provides: ["ginst_* service-control functions", "i18n (btki18nSetup/Cleanup)", authorize_main, ptc_exit_run, msgID_sput_buffer]
+    source_in_archive: false
+    identity: UNKNOWN
+    declared_in: pim/includes/imp_pim_dll.h
+
+not_in_archive_but_referenced:
+  - launcher_exe_projects: [pim.exe, pim_rm.exe, pim_re.exe, pim_rl.exe]
+  - build_system: UNKNOWN
+  - sample_product_definition_xml: none
+  - btk_toolkit_full_source: "only btkunzip.h/.cxx present"

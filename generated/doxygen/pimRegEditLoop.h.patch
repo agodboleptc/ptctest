@@ -1,0 +1,184 @@
+--- a/pim_core/includes/pimRegEditLoop.h
++++ b/pim_core/includes/pimRegEditLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -17,28 +17,160 @@
+ #include <pimConvert.h>
+ #include <pimRegFileCreate.h>
+ 
++/**
++ * Install-step (pimLoop subclass) that creates and removes Windows registry
++ * keys/values declared in product XML, and manages a legacy "numeric
++ * file-extension" registration scheme (.1 to .250 under Software\Classes)
++ * for older Creo file-association behavior.
++ *
++ * Responsibilities:
++ * - Iterate <REGISTRY>/<VALUE> elements; for each, resolve a [HKCR]/[HKLM]/
++ *   [HKCU]/[HKU] root token plus subkey path from the "key" attribute, and
++ *   create (OnInstall) or remove (OnRollback) the corresponding value.
++ * - Gate each <VALUE package="X"> entry on package X's own install="Y" state.
++ * - Mirror every successful create into a human-readable .reg file via
++ *   pimRegFileCreate (per-product created.reg plus a combined
++ *   CommonCreated.reg).
++ * - Optionally register/deregister the legacy .1-.250 numeric file
++ *   extensions, tracked via a persisted high-water mark at
++ *   HKCU\Software\PTC\creoFileVers.
++ *
++ * CONFIRMED BUG: OnRollback()'s node-list loop double-increments its index
++ * (both the for-loop's own increment and an explicit item(index++) call),
++ * so it silently skips every other <REGISTRY> entry on every pass -- contrast
++ * with OnInstall()'s correctly single-incrementing equivalent loop. This can
++ * leave roughly half of a product's registry entries behind on
++ * uninstall/rollback. See docs/classes/pimRegEditLoop.md Risk Analysis.
++ *
++ * Owned by: pimRegEdit (pim_core/includes/pimRegEdit.h), a process-wide
++ * singleton (GetInstance()) -- NOT a per-entitlement object. Only one
++ * registry create/remove operation can be in flight across the whole
++ * process at a time.
++ */
+ class pimRegEditLoop : public pimLoop
+ {
+ private:
+ 	int do_rollback;
+ protected:
++	/**
++	 * Thread entry point; dispatches to OnInstall() or OnRollback() based on
++	 * do_rollback.
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * For each eligible <VALUE> node (package-gate permitting): parses the
++	 * key="[ROOT]SubKey" attribute, reads optional id/valuename/default/
++	 * valuetype attributes, and calls Create(). Marks installed="Y" on
++	 * success and appends a pimErrorRegEdit error on failure. Also resolves
++	 * the [THIS_ARCH] platform placeholder and, if RegEdit1To250 is set,
++	 * additionally runs CreateNumericExtensions().
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * Removes registry values/keys previously marked installed="Y". Repeats
++	 * a full pass over the node list until a pass removes nothing further,
++	 * to accommodate Remove()'s bottom-up (leaf-before-parent) deletion
++	 * constraint. If RemoveNumericExtensions XML property is set, also calls
++	 * RemoveNumericExtensions().
++	 *
++	 * CONFIRMED BUG: this loop's index is double-incremented (see class-level
++	 * doc), so it skips every other node on every pass, not just a slower
++	 * convergence -- odd-indexed nodes are never visited.
++	 * @return void
++	 */
+ 	void OnRollback();
++
++	/**
++	 * Standard thread teardown: releases the logger handle, marks the Loop
++	 * done under Mutex, and clears the in-progress flag.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
++	/**
++	 * @param highest Receives the persisted high-water mark from
++	 *   HKCU\Software\PTC\creoFileVers, or -1 if not present.
++	 * @return true if a value was found.
++	 */
+ 	bool GetHighestCreoFileVer(int &highest);
++
++	/**
++	 * Persists the given high-water mark to HKCU\Software\PTC\creoFileVers.
++	 * @param highest The new high-water mark to store.
++	 * @return true on success.
++	 */
+ 	bool SetHighestCreoFileVer(int highest);
+ 
+-	bool Create(pimRegFileCreate &, const btkString &Key, const btkString &Id, 
++	/**
++	 * Creates (or opens) a registry key under the root named by Key
++	 * ([HKCR]/[HKLM]/[HKCU]/[HKU]) at path Id, and if DefValue is non-empty,
++	 * writes it as the named value ValueName (or the key's default value if
++	 * ValueName is empty), as ValueType (REG_SZ or REG_DWORD). Mirrors the
++	 * write into RegFileCreate's .reg output. If ValueName is empty, also
++	 * unconditionally appends a "key visited" entry to the .reg mirror using
++	 * a separately-converted copy of DefValue -- see
++	 * docs/classes/pimRegEditLoop.md for a confirmed [THIS_ARCH] substitution
++	 * ordering asymmetry between this mirror entry and the actual write.
++	 *
++	 * @param RegFileCreate Accumulates the human-readable .reg mirror output.
++	 * @param Key Root-hive token: one of [HKCR]/[HKLM]/[HKCU]/[HKU].
++	 * @param Id Subkey path under the root.
++	 * @param ValueName Named value to write, or empty for the key's default value.
++	 * @param DefValue The value data to write; skipped if empty.
++	 * @param Converter Resolves property placeholders (including, for the
++	 *   live write, [THIS_ARCH] when plat is non-empty).
++	 * @param created Set true if the key was newly created.
++	 * @param existed Set true if the key already existed.
++	 * @param default_changed Set true if a value was actually written.
++	 * @param plat Platform string substituted for [THIS_ARCH] in the live write.
++	 * @param ValueType REG_SZ (default) or REG_DWORD.
++	 * @return true on success.
++	 */
++	bool Create(pimRegFileCreate &, const btkString &Key, const btkString &Id,
+ 		       const btkString &ValueName, const btkString &DefValue, pimConvert *,
+ 		       bool &created, bool &existed, bool &default_changed,const btkString &plat, DWORD ValueType = REG_SZ);
++
++	/**
++	 * Registers legacy numeric file extensions .1-.250 (skipping .0 and,
++	 * for an UNCONFIRMED reason, .123) under Software\Classes, per the
++	 * "Always do .1 to .250" revision history -- always walks the full
++	 * range rather than resuming from the prior high-water mark.
++	 * @param do_create_reg_file Also mirror each registration into the .reg file.
++	 * @return true on success.
++	 */
+ 	bool CreateNumericExtensions(bool);
++
++	/**
++	 * Removes the legacy numeric file extensions previously registered by
++	 * CreateNumericExtensions(), from the persisted high-water mark down to
++	 * .1 (skipping .123), then resets the high-water mark to 0.
++	 * @return true on success.
++	 */
+ 	bool RemoveNumericExtensions();
++
++	/**
++	 * Deletes a single named value (if ValueName is non-empty), or the whole
++	 * key at Id (if ValueName is empty) -- but only if that key has zero
++	 * subkeys, per its own bottom-up deletion safety comment. A key with
++	 * existing subkeys is left in place and this returns false for it.
++	 * @param Key Root-hive token: one of [HKCR]/[HKLM]/[HKCU]/[HKU].
++	 * @param Id Subkey path under the root.
++	 * @param ValueName Named value to remove, or empty to remove the whole key.
++	 * @return true on success.
++	 */
+ 	bool Remove(const btkString &Key, const btkString &Id, const btkString &ValueName);
+ 
+ 	//bool IsOKToDelete(const btkString &Key, const btkString &Id);
+ public:
++	/**
++	 * Constructs a pimRegEditLoop bound to the given XML content, with
++	 * do_rollback initialized to false.
++	 * @param ScriptXMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimRegEditLoop(pimXmlFile *ScriptXMLContent) : pimLoop(ScriptXMLContent)
+ 	{
+ 		do_rollback = false;
+@@ -47,6 +179,12 @@
+ 	/*
+ 	 * scripts that have attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Marks this Loop to run OnRollback() (remove installed="Y" registry
++	 * entries) instead of OnInstall() when Execute()d.
++	 * @param tf New rollback-mode flag value.
++	 * @return void
++	 */
+ 	void SetRollback(bool tf) { do_rollback = tf; }
+ 
+ };

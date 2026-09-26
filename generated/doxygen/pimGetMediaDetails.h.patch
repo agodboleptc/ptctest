@@ -1,0 +1,52 @@
+--- a/pim_core/includes/pimGetMediaDetails.h
++++ b/pim_core/includes/pimGetMediaDetails.h
+@@ -12,6 +12,13 @@
+ #include <pimCore.h>
+ #include <pimXmlFile.h>
+ 
++/**
++ * Process-wide cache/fetcher for PTC.com media "details" XML (display info
++ * plus per-file download URLs) and the product-definition XML files it
++ * references. Every web-media (download-from-PTC.com) code path resolves a
++ * (MediaID, xmlFilename) pair through this class. See
++ * docs/classes/pimGetMediaDetails.md.
++ */
+ class pimGetMediaDetails
+ {
+ private:
+@@ -22,14 +29,35 @@
+ 
+ protected:
+ 	pimGetMediaDetails();
++	/** Empty, with a literal `// TODO cleanup` in its body -- DetailRecords' heap-allocated entries are never freed. Moot in practice: OnlyInstance is never explicitly destroyed anywhere in this archive. */
+ 	~pimGetMediaDetails();
+ 
++	/** CONFIRMED: only guards the mutating paths of GetDetails() -- the cache-hit fast path reads DetailRecords with no lock at all. See docs/classes/pimGetMediaDetails.md Risk Analysis. */
+ 	thrMutex Mutex;
+ public:
+ 	static pimGetMediaDetails& GetInstance();
+ 
++	/**
++	 * Returns the cached details document for MediaId if present and
++	 * `!refresh`; otherwise fetches fresh from PTC.com and caches the
++	 * result. Returns NULL on any fetch/parse/auth failure.
++	 * CONFIRMED BUG: the cache-hit path takes no lock, unlike every
++	 * mutating path -- see docs/classes/pimGetMediaDetails.md Risk Analysis.
++	 */
+ 	pimXmlFile *GetDetails(const char *MediaId, btkWString &wname, btkWString &wpasswd, bool refresh = false);
+ 	// GetDetails should be called first.
++	/**
++	 * Resolves a specific product-definition XML file's URL out of MediaId's
++	 * already-cached details document and downloads it. CONFIRMED BUG: the
++	 * single-retry-on-timeout path refreshes the details cache but then
++	 * retries with the stale, pre-refresh URL string -- contrast with the
++	 * correct pattern in pimEntitlement::UpdateMediaUrls(). Returns NULL on
++	 * a NULL argument, an uncached MediaId, no matching URL entry, or 2
++	 * consecutive timeouts -- confirmed to be the source of the NULL that
++	 * reaches pimEntitlementTree::OnOptionMenuSelect()'s already-documented
++	 * unconditional-dereference bug. See
++	 * docs/classes/pimGetMediaDetails.md Risk Analysis.
++	 */
+ 	pimXmlFile *GetProductXml(const char *MediaId, const char *xml_filename);
+ };
+ 

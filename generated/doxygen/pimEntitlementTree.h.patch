@@ -1,0 +1,140 @@
+--- a/pim_ui/includes/pimEntitlementTree.h
++++ b/pim_ui/includes/pimEntitlementTree.h
+@@ -24,28 +24,48 @@
+ #define PIM_SHOW_ICON              (1 << 0)
+ #define PIM_SHOW_VERSION           (1 << 1)
+ #define PIM_SHOW_VERSION_MENU      (1 << 2)
+-#define PIM_SHOW_DOWNLOAD_SIZE     0 // (1 << 3)  //disable download column for now
+-#define PIM_SHOW_INSTALL_SIZE      0 // (1 << 4)  //disable install size column for now
+-#define PIM_SHOW_QAGENT_STATUS     0 // (1 << 5)  //disable qagent column for now
++#define PIM_SHOW_DOWNLOAD_SIZE     0 // (1 << 3)  //disable download column for now  -- CONFIRMED: hardcoded to 0, permanently dead regardless of caller's SetColumns() flags
++#define PIM_SHOW_INSTALL_SIZE      0 // (1 << 4)  //disable install size column for now  -- CONFIRMED dead, same as above
++#define PIM_SHOW_QAGENT_STATUS     0 // (1 << 5)  //disable qagent column for now  -- CONFIRMED dead, same as above
+ #define PIM_SHOW_LICENSED          (1 << 6)
+ #define PIM_SHOW_STATUS            (1 << 7)
+ 
+-// used in Entitlement step to display applications 
+-// to install or reconfigure
+-// 
+-// ::SetColumns allows changing the column display without the tree
+-// having to understand if it is web download or not
+-// ::SetCallback allows callbacks for currently 3 events to allow
+-// external tree UI to be updated
+-//
++/**
++ * @brief The checkbox tree driving the wizard's "Applications" selection step
++ *        (new/download and reconfigure modes), grouped into runtime-discovered
++ *        per-family nodes (Creo, Mathcad, Utilities, etc.).
++ *
++ * Owns per-row UI components it creates dynamically (quality-agent checkboxes,
++ * "customize" icon buttons, version/shipcode option menus) as entitlements are
++ * added/removed, but does NOT own the pimEntitlement objects themselves
++ * (borrowed from pimSessionInfo). Bidirectionally coupled to pimInstallMgrDlg,
++ * which owns this class as a direct member (ApplicationsTree) AND grants it
++ * friend access, so this class reaches back into its owner via the global
++ * GetMainUIDialog() pointer.
++ *
++ * CONFIRMED BUGS (see docs/classes/pimEntitlementTree.md Risk Analysis for
++ * full detail, evidence, and line citations):
++ *  - OnOptionMenuSelect() dereferences eptr_new_xml via ->SetXml() immediately
++ *    after an `if (eptr_new_xml)` guard that covers only the 2 preceding
++ *    lines -- a null-pointer-dereference crash risk when
++ *    pimGetMediaDetails::GetProductXml() returns NULL for the selected media.
++ *  - ReconfigureDisplay_low()'s only_one branch strips one character too many
++ *    from the family-group node id ("_Creo_app" -> "_Cre" instead of "_Creo"),
++ *    confirmed by contrast with UpdateGroupStatus()'s correctly-computed
++ *    sibling id extraction -- reachable whenever a reconfigure session has
++ *    exactly 1 entitlement.
++ *
++ * This class is also the confirmed 2nd call site (via OnPushButtonActivate())
++ * for pimCustomDlg -- see docs/classes/pimCustomDlg.md.
++ */
+ class pimEntitlementTree : public uiTree
+ {
+ private:
+-	btkXArray <pimEntitlement *>    mItems;
+-	btkXArray <uiCheckButton *>     mAgentboxes;
+-	uitTreeChkBoxCol                AgentHandler;
+-	btkXArray <uiPushButton *>      mIcons;
+-	btkXArray <uiOptionMenu *>      mVersionMenus;
++	btkXArray <pimEntitlement *>    mItems;              ///< Borrowed pointers (owned by pimSessionInfo), never deleted here.
++	btkXArray <uiCheckButton *>     mAgentboxes;          ///< Owned; XNew'd per row, deleted by RemoveAgentBox().
++	uitTreeChkBoxCol                AgentHandler;         ///< Lazily created via uit_tree_checkbox_col_register(); never explicitly unregistered.
++	btkXArray <uiPushButton *>      mIcons;               ///< Owned; the per-row "customize" icon buttons that construct pimCustomDlg.
++	btkXArray <uiOptionMenu *>      mVersionMenus;        ///< Owned; the per-row version/shipcode dropdowns.
+ 	StringXArray family_grp;
+ 	int family_count;
+ 
+@@ -72,20 +92,31 @@
+ 
+ 	bool PreRequisiteHasSelectedParent(pimEntitlement *E);
+ 	bool FindAfterNodeByType(cStringT type, pimEntitlement *E, btkString &after);
++	/// Per-row state computation for normal (non-reconfigure) mode; contains a
++	/// hardcoded, product-tag-keyed special-case rule cluster (see class doc).
+ 	bool UpdateDisplay_low(pimEntitlement *ptr = NULL);
+ 	void UpdateDisplay_finish();
++	/// Per-row state computation for reconfigure mode. CONFIRMED BUG in the
++	/// only_one branch: strips one character too many from the computed
++	/// family-group node id -- see class-level comment and docs/classes/pimEntitlementTree.md.
+ 	bool ReconfigureDisplay_low(pimEntitlement *ptr = NULL, bool only_one = false);
+ 	void ReconfigureDisplay_finish();
+ 
+ 	void UpdateAgentStatus();
++	/// Computes and applies the tri-state (all/some/none) family-group checkbox
++	/// state; its own id-extraction (grp_node(1, grp_node.GetSize()-1)) is the
++	/// CORRECT sibling contrasted against ReconfigureDisplay_low()'s confirmed bug.
+ 	void UpdateGroupStatus(btkString &);
+ 	void SetSelectionStatus(btkString &, bool state);
++	/// 3-way source of family names: physical media image <FAMILY> nodes, a
++	/// hardcoded single "Creo" fallback in reconfigure mode with no image, or
++	/// the web-install AvailableDownloads list.
+ 	void GetFamilyListForTree();
+ public:
+ 	pimEntitlementTree (cStringT Id);
+ 
+ 	bool AddEntitlement(pimEntitlement &);
+-	
++
+ 	bool RemoveEntitlementNode(pimEntitlement *E);
+ 	bool RemoveAllEntitlementNodes();
+ 
+@@ -94,6 +125,9 @@
+ 	void SetColumns(int flags);
+ 	void SetReconfigure(bool tf);
+ 	bool GetReconfigure();
++	/// CONFIRMED: accumulates into size_required WITHOUT zeroing it first --
++	/// caller must pre-zero. Both confirmed callers do; this contract is
++	/// otherwise undocumented and unenforced.
+ 	void GetPrerequisiteSizeRequired(double &size_required);
+ 
+ 	enum CallbackType
+@@ -102,9 +136,12 @@
+ 		QualityAgentChanged,
+ 		VersionChanged
+ 	};
+-	
++
+ 	void SetCallback(CallbackType, void (*f)(void));
+-	
++
++	/// Main refresh entry point. With NULL, iterates all rows and, in
++	/// reconfigure mode, passes only_one=true to ReconfigureDisplay_low()
++	/// exactly when there is 1 entitlement -- the confirmed bug's trigger.
+ 	bool UpdateDisplay(pimEntitlement *ptr = NULL);
+ 	//bool			OnHide();
+ 	//bool			OnShow();
+@@ -120,8 +157,13 @@
+     bool            OnUpdate (char *Node, int State);
+ 	bool			OnExpand (cStringT Node);
+ 	bool			OnCollapse (cStringT Node);
++	/// Per-row "customize" icon handler -- constructs/Initialize()s/Display()s
++	/// a pimCustomDlg (the confirmed 2nd call site for that class). Resolves
++	/// the clicked row's pimEntitlement but never forwards it to pimCustomDlg,
++	/// which has no parameter for a target entitlement -- see
++	/// docs/classes/pimCustomDlg.md Risk Analysis #2.
+ 	bool			OnPushButtonActivate(uiPushButton &pushed);
+-	
++
+ };
+ 
+ #endif

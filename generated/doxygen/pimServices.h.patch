@@ -1,0 +1,163 @@
+--- a/pim_core/includes/pimServices.h
++++ b/pim_core/includes/pimServices.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -13,6 +13,34 @@
+ #include <threadlibcxx.h>
+ #include <pimServiceLoop.h>
+ 
++/**
++ * Process-wide singleton "owner" wrapper around pimServiceLoop, the install
++ * step that installs/removes/starts/stops Windows services. One of 7
++ * near-identical Loop-owner wrapper singletons in pim_core. Also owns the
++ * class-static serviceAction field that tells pimServiceLoop::OnExecute()
++ * which of Install/Start/Stop to perform (set via setServiceAction()
++ * immediately before every Create() call at the confirmed call site).
++ *
++ * CONFIRMED HIGH-SEVERITY FINDING: unlike every one of its 6 sibling
++ * wrappers, Create_low() releases its xmlMutex lock IMMEDIATELY after
++ * starting the operation's thread, not after the operation completes (the
++ * trailing "will be released ... when done" comment is a stale copy-paste
++ * from the sibling classes and is factually wrong here). Consequence: a
++ * second Create()/Uninstall() call made while a prior pimServiceLoop is
++ * still running will succeed at TryLock() (since it is already unlocked),
++ * then delete the still-running pimServiceLoop out from under its own
++ * thread -- a genuine use-after-free / destroy-while-running race. This is
++ * currently latent because no traced caller in this codebase invokes this
++ * class concurrently, but it is live, reachable code, not gated behind any
++ * dead-code marker. Do not add a concurrent caller of this class without
++ * first relocating the xmlMutex.Unlock() call to Status()'s done-branch and
++ * Kill(), matching the other 6 wrappers' pattern.
++ *
++ * Also confirmed gap (shared with pimShortcuts/pimRegEdit/pimDownloader):
++ * Cancel() only sets a flag; the owned pimServiceLoop is not stopped by it.
++ *
++ * Sole caller in this codebase: pimEntitlement.
++ */
+ class pimServices
+ {
+ private:
+@@ -31,11 +59,22 @@
+ 	pimServiceLoop *ServiceLoop;
+ 
+ public:
++	/** @return The singleton instance, constructing it on first call. */
+ 	static pimServices& GetInstance();
+ 
+ protected:
+ 	pimServices();
+ 	~pimServices(){}
++
++	/**
++	 * Shared implementation behind Create()/Uninstall(). Constructs a
++	 * pimServiceLoop, sets its rollback flag if uninstalling, and Execute()s
++	 * it asynchronously. CONFIRMED: releases xmlMutex immediately after
++	 * starting the thread rather than holding it for the operation's
++	 * duration -- see class-level doc for the resulting race condition.
++	 * @param uninstall Configures the Loop to remove the service.
++	 * @return true if the lock was acquired and the operation started; false if busy.
++	 */
+ 	int Create_low(pimXmlFile *, bool uninstall = false);
+ private:
+ 	//pimServices(const pimServices&);
+@@ -54,43 +93,88 @@
+ 	enum ServiceAction
+ 	{
+ 		InstallAction,
+-		
++
+ 		StopAction,
+-		StartAction,  
++		StartAction,
+ 	};
+-	// these use TRYLock 
++	// these use TRYLock
+ 	// return 1 if successfull and Download will happen
+ 	// return 0 if you should try again after a sleep
+-	// return negative if you should not try again 
+-	// 
++	// return negative if you should not try again
++	//
++	/**
++	 * Starts a service operation using the action last set via
++	 * setServiceAction(). Non-blocking; delegates to Create_low(xmlPtr, false).
++	 * @return 1 if started; 0 if another operation is in progress; negative on error.
++	 */
+ 	int Create(pimXmlFile *);
++
++	/**
++	 * Starts a service-removal operation. Non-blocking; delegates to
++	 * Create_low(xmlPtr, true).
++	 * @return 1 if started; 0 if another operation is in progress; negative on error.
++	 */
+ 	int Uninstall(pimXmlFile *);
++
++	/** @return The process-wide current ServiceAction (InstallAction/StopAction/StartAction). */
+ 	static ServiceAction getServiceAction();
++
++	/**
++	 * Sets the process-wide current ServiceAction, read by
++	 * pimServiceLoop::OnExecute() to decide which operation to perform.
++	 * Must be called before Create() since neither Create() nor the
++	 * pimServiceLoop constructor takes an action parameter directly.
++	 * @param sa The action to perform on the next Create() call.
++	 * @return void
++	 */
+ 	void setServiceAction(ServiceAction sa);
++
+ 	// After Download() starts returns call Status
+ 	// until IDLE state.
+ 	// OUTPUTS:
+ 	// percent_downloaded 0 - 100
+ 	// estimate_remaining in seconds
++	/**
++	 * Polls the operation's progress. NOTE: percent_done is never actually
++	 * written by this implementation -- treat it as unreliable. On first
++	 * observing the operation is done, deletes the owned pimServiceLoop
++	 * (does not touch xmlMutex here -- it was already released by Create_low()).
++	 * @param percent_done Declared as a progress output but not populated.
++	 * @return Current ServiceStatus.
++	 */
+ 	ServiceStatus Status(int &percent_done);
+ 
+ 	// Put into a hold after the current download file
+ 	// completes
++	/** Sets a caller-facing pause_flag reported by Status(); does not itself pause the operation. */
+ 	void Pause();
+ 
+ 	// Resume Pause
++	/** Clears pause_flag. */
+ 	void Resume();
+ 
+-	// Cancel - set cancel flag to stop after current download file 
++	// Cancel - set cancel flag to stop after current download file
+ 	// and release/reset all flags so another thread could start
++	/**
++	 * Sets cancel_flag only. Does NOT call anything on the owned
++	 * pimServiceLoop -- the operation keeps running until it finishes
++	 * naturally or Kill() is called.
++	 * @return void
++	 */
+ 	void Cancel();
+ 
+ 	// Release/reset all flags killing anything in progress
++	/**
++	 * If an operation is in progress, kills the owned pimServiceLoop and
++	 * deletes it (does not touch xmlMutex -- already released by
++	 * Create_low()).
++	 * @return void
++	 */
+ 	void Kill();
+ 
+ private:
+ 	static ServiceAction serviceAction;
+-	
++
+ };
+ 
+ #endif

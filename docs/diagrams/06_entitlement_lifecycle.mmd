@@ -1,0 +1,24 @@
+%% Entitlement Lifecycle State Diagram (from docs/06_entitlement_framework.md §2)
+%% Source: docs/06_entitlement_framework.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+stateDiagram-v2
+    [*] --> Constructed: pimSessionInfo::AddEntitlement()
+    Constructed --> Initialized: Init(xmlFile) / Init(xml, urls, mediaId)
+    Initialized --> SelectionPending: registered in EntitlementArray;\nSetInstallMe()/SetReconfigureMe() from UI or defaults
+    SelectionPending --> Running: StartOrRestartInstall() / Reconfigure() / Uninstall()\n(spawns thread via inherited pimLoop::Execute())
+    Running --> OnExecuteGate: OnExecute() prerequisite gate
+    OnExecuteGate --> WaitingOnPrerequisite: HasPrerequisite() && !HasPrerequisitesInstallSucceeded()
+    WaitingOnPrerequisite --> Running: re-invoked once prerequisite completes (external caller's responsibility)
+    OnExecuteGate --> Reconfiguring: in_reconfigure
+    OnExecuteGate --> Updating: UpdateOfProduct != NULL
+    OnExecuteGate --> Installing: fresh install (no update)
+    Updating --> Installing: upgrade pre-cleanup done, falls into OnInstall()
+    Installing --> Done: pipeline completed (see docs/04_installation_flow.md)
+    Installing --> Cancelling: IsCancelFlagSet() observed mid-pipeline
+    Installing --> RollingBack: do_rollback / do_install_rollback set
+    Cancelling --> RollingBack: only if ROLLBACK_CANCELLED_INSTALL is defined (NOT found in this archive -- see docs/04_installation_flow.md §5)
+    Cancelling --> Done: otherwise, stops in place
+    RollingBack --> Done: OnRollback() completes
+    Reconfiguring --> Done
+    Done --> [*]: entitlement object persists in pimSessionInfo's arrays until DropEntitlement()/DropInstalledEntitlement() or session end

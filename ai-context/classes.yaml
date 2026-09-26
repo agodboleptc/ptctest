@@ -1,0 +1,91 @@
+# Per-class structured summary for the 5 classes given full Phase 5 treatment.
+# Source of truth: docs/classes/*.md. Other classes referenced throughout the
+# codebase (pimMSILoop, pimSFXLoop, pimRegEditLoop, pimInterrogator, pim_ui dialogs,
+# etc.) are NOT yet documented at this granularity — see modules.yaml for what's
+# known about them at module level.
+
+classes:
+  pimLoop:
+    doc: docs/classes/pimLoop.md
+    file: {header: pim_core/includes/pimLoop.h, impl: pim_core/pim_core_src/pimLoop.cxx}
+    inherits: thrThread   # external btk
+    purpose: "Abstract base for every threaded, cancelable install step, and for pimEntitlement itself"
+    key_members: [mCancel, mDone, mPause, mInProgress, xmlPtr, pausePtr, Errors, Warnings, Mutex]
+    key_methods: [Execute, Cancel, IsCancelFlagSet, IsDone, Pause, Resume, HasErrors, GetErrors, HasWarnings, GetWarnings, Kill, Wait]
+    thread_safety: "All lifecycle flags + Errors/Warnings guarded by a recursive Mutex; xmlPtr's own locking is separate (see pimXmlFile)"
+    lifetime: "Owned by whichever class constructs it (owner wrapper, or pimEntitlement transiently for Script/Psf loops)"
+    risk_level: MEDIUM
+    risks:
+      - "OnUnhandled crashes the whole process on any uncaught thread exception (no per-step isolation)"
+      - "Errors/Warnings are unstructured newline-joined strings, not structured objects"
+      - "Pause()'s actual blocking must be implemented per-subclass; easy to omit"
+
+  pimEntitlement:
+    doc: docs/classes/pimEntitlement.md
+    file: {header: pim_core/includes/pimEntitlement.h, impl: pim_core/pim_core_src/pimEntitlement.cxx}
+    inherits: pimLoop
+    purpose: "One installable product; orchestrates its entire install/update/reconfigure/uninstall/rollback lifecycle"
+    loc: 7649   # implementation file line count
+    key_members: [ID, Tag, Family, PrimaryLicensePrefix, IamInCopy, PreRequisitesToHandle, SoftPreRequisites, UpdateOfProduct, DownloadXmlBackups]
+    owns: [pimCopier, pimServices]   # header-visible; pimMSICopier/pimSFXCopier/pimShortcuts/pimDownloader owned by the same pattern per .cxx evidence
+    creates_transiently: [pimScriptLoop, pimPsfLoop]
+    key_methods: [OnExecute, OnInstall, OnUpdate, OnReconfigure, OnRollback, StartCopy, InstallMSI, ApplyRegistryChanges, InstallScripts, PerformServiceAction, InstallPSF, InstallShortcuts, AddPrerequisite, IsPrerequisiteSatisfied, HasPrerequisitesInstallSucceeded]
+    friend_classes: [upimDlg, upimSilentProgress]
+    thread_safety: "Inherits pimLoop's Mutex; adds a SEPARATE PctMutex for progress counters (total_pct_done/download_pct_done) - two independently-locked state groups on one object"
+    lifetime: "Created by pimSessionInfo::AddEntitlement; held in EntitlementArray/InstalledArray for session lifetime"
+    risk_level: HIGH
+    risks:
+      - "7649-line single file: highest change-risk in the codebase"
+      - "friend classes bypass the public API, coupling UI code to private layout"
+      - "Two independent mutexes guarding related state (done/cancel vs progress)"
+      - "DropPrerequisite deletes the referenced object; dangling-pointer risk if held elsewhere"
+
+  pimSessionInfo:
+    doc: docs/classes/pimSessionInfo.md
+    file: {header: pim_core/includes/pimSessionInfo.h, impl: pim_core/pim_core_src/pimSessionInfo.cxx}
+    purpose: "Top-level session state: entitlement collection, license/security context, generic property bag"
+    key_members: [xmlPtr, xmlWhatsInstalled, ValidateLicenseSources, EntitlementArray, InstalledArray, SecurityArray, Mutex]
+    key_methods: [SetProperty, GetProperty, AddEntitlement, GetEntitlement, AddLicenseSource, GetLicenseSourceByIdx, StartValidateThread, Save, PrepareForShutdown]
+    nested_types: [pimSecurity, "LicenseStatus (13-value enum)"]
+    thread_safety: "Guarded by a thrRWLock* (read/write lock) — implies many-reader/exclusive-writer design intent"
+    lifetime: "One instance per process run, stack-allocated in each pim*Run function"
+    risk_level: MEDIUM
+    risks:
+      - "Property bag is the de facto config mechanism; string-keyed, no schema"
+      - "13-state LicenseStatus enum's assignment logic only partially traced"
+
+  pimXmlFile:
+    doc: docs/classes/pimXmlFile.md
+    file: {header: pim_core/includes/pimXmlFile.h, impl: pim_core/pim_core_src/pimXmlFile.cxx}
+    purpose: "Xerces-C++ DOM wrapper used for every XML document in PIM, with a PROPERTY-style convenience API and explicit read/write locking"
+    key_members: [doc, parser, xmlMutex, classMutex, wLockEngaged, mReadingCount, mReadLock]
+    key_methods: [DoRead, DoSave, DoWrite, SetProperty, GetProperty, PreRead, PostRead, PreWrite, PostWrite, PushReadToWrite, PopWriteToRead, GetNextNodelistItem]
+    nested_types: [DOMTreeErrorReporter, StrX, DOMPrintErrorHandler, DOMPrintFilter]
+    thread_safety: >
+      Explicit read/write lock protocol (PreRead/PostRead, PreWrite/PostWrite,
+      PushReadToWrite/PopWriteToRead). CONFIRMED REAL BUG HISTORY: revision log
+      entries "Fixed xml mutex issues" (2026-06-26) and "Added temporary logs to
+      investigate locks issue" (2026-04-22).
+    lifetime: "Heap-allocated (XNew), explicitly deleted by owner, or long-lived as an entitlement's/session's own xmlPtr"
+    risk_level: HIGH
+    risks:
+      - "Confirmed historical locking bugs — treat any change to the lock protocol as high-risk"
+      - "Manual PreRead/PreWrite bracketing required for raw traversal outside convenience methods; easy to omit silently"
+      - "Three distinct synchronization primitives on one class (xmlMutex, classMutex, mReadLock)"
+
+  pimCopyLoop:
+    doc: docs/classes/pimCopyLoop.md
+    file: {header: pim_core/includes/pimCopyLoop.h, impl: pim_core/pim_core_src/pimCopyLoop.cxx}
+    inherits: pimLoop
+    purpose: "File copy + archive extraction/removal install step"
+    modified_this_session: true
+    modification_summary: >
+      pimInstallCab/pimRemoveCab changed from Windows Cabinet SDK (.cab, via
+      pim_util's pimCopyCabinetArch/pimListCabinetContent) to btkUnzip/libzip
+      (.zip). Method names and #include <pimCab.h> retained.
+    owned_by: pimCopier   # pim_core/includes/pimCopier.h
+    key_methods: [OnExecute, OnInstall, OnRollback, OnRollbackCabs, OnRemoveLoadpoint, pimInstallCab, pimRemoveCab]
+    risk_level: MEDIUM
+    risks:
+      - "Naming now mismatches behavior: pimInstallCab/pimRemoveCab extract .zip, not .cab"
+      - "pim_util's legacy CAB implementation remains live but unreferenced from this file"

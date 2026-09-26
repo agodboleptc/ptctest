@@ -1,0 +1,17 @@
+%% Module-level Dependencies (from docs/02_architecture_overview.md §4)
+%% Source: docs/02_architecture_overview.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+graph LR
+    pim --> pim_core
+    pim --> pim_ui
+    pim --> pim_util
+    pim_ui --> pim_core
+    pim_ui --> pim_util
+    pim_core --> pim_util
+    pim_core --> BTK[btk toolkit - EXTERNAL]
+    pim_ui --> BTK
+    pim_util --> BTK
+    pim_util --> Win32[Win32 / MSI / FDI / FlexNet - EXTERNAL]
+    pim_core --> Xerces[Xerces-C - EXTERNAL]
+    pim --> PTCOther["Other PTC platform DLL(s) - EXTERNAL/UNKNOWN"]
