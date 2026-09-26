@@ -1,0 +1,259 @@
+--- a/pim_core/includes/pimMSILoop.h
++++ b/pim_core/includes/pimMSILoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Apr-12 P-20-03   TWH   $$1    Created
+@@ -17,24 +17,163 @@
+ #include <pimLoop.h>
+ #include <pimCab.h>
+ #include<pimConvert.h>
++
++/**
++ * Install-step (pimLoop subclass) that installs Windows Installer (MSI)
++ * packages declared in product XML, via one of two execution strategies
++ * selected by use_msiexec: launching msiexec.exe as an external child
++ * process (pimMSIExec(), the default), or calling the MSI API directly
++ * in-process for a genuine progress callback and mid-install cancellation
++ * (OnInstall()).
++ *
++ * Responsibilities:
++ * - Iterate <MSI> elements (gated by package-level and node-level
++ *   install="Y") and install each eligible one via the active strategy.
++ * - Interpret the exit code against the well-known Windows Installer
++ *   vocabulary shared with pimSFXLoop (0/1602/1259/1618/1637/1633/1632/
++ *   1625/1619/1613/1641/1620/1603/3010), treating 1618 as CANCELLATION here
++ *   (the confirmed intentional divergence from pimSFXLoop, which treats
++ *   1618 as failure -- see docs/classes/pimSFXLoop.md).
++ * - On a genuine failure, deselect the MSI's parent <PACKAGE> (install="N").
++ * - (pimMSIExec() path only) append a successful install's uninstall
++ *   command to a shared, per-product-mode Uninstall_all_utilities.bat file.
++ *
++ * CONFIRMED BUGS (see docs/classes/pimMSILoop.md Risk Analysis for full
++ * detail):
++ * - OnInstall()'s fallback_to_msiexec flag is checked at the END OF EVERY
++ *   loop iteration rather than once after the loop, and is never reset once
++ *   set -- so a single node that can't be pattern-matched for its property
++ *   list causes EVERY remaining node's iteration to re-invoke pimMSIExec(),
++ *   which re-scans and can re-install every eligible <MSI> in the document
++ *   (its IsEligibleForInstall() gate does not check the "installed"
++ *   past-tense attribute). An O(N^2) redundant-reinstall risk on legacy XML.
++ * - The same_msihybrid skip logic in OnInstall()'s first pass over <MSI>
++ *   nodes has no effect on which MSIs are actually processed -- it only
++ *   logs a debug message; the real install loop never checks this property.
++ *
++ * Owned by: pimMSICopier (pim_core/includes/pimMSICopier.h), a process-wide
++ * singleton whose serialization gate is SHARED with pimSFXCopier -- see
++ * docs/classes/pimMSICopier.md.
++ */
+ class pimMSILoop : public pimLoop
+ {
+ private:
++	/**
++	 * Sums the <MSI size="..."> attributes of every eligible node into
++	 * expected_installed_size. pimMSIExec()-path only.
++	 * @return void
++	 */
+ 	void pimSetExpectedInstalledSize();
++
++	/**
++	 * Adds one node's declared size to the running installed_size total.
++	 * pimMSIExec()-path only.
++	 * @param map The <MSI> node's attribute map.
++	 * @return void
++	 */
+ 	void pimSetInstalledSize(DOMNamedNodeMap* map);
++
++	/**
++	 * Checks the parent <PACKAGE>'s own install="Y" (if linked via a
++	 * package attribute) AND this node's own install="Y". Does NOT check
++	 * the separate installed (past-tense) attribute.
++	 * @param map The <MSI> node's attribute map.
++	 * @return true if this node should be installed.
++	 */
+     bool IsEligibleForInstall(DOMNamedNodeMap* map);
++
++	/**
++	 * Resolves a human-readable label from the linked <PACKAGE>'s label
++	 * attribute, used to prefix error messages.
++	 * @param map The <MSI> node's attribute map.
++	 * @param label Receives the resolved label.
++	 * @return true if a label was found.
++	 */
+ 	bool GetPackageLabel(DOMNamedNodeMap* map, btkString& label);
++
++	/**
++	 * Sets the installed attribute on node and flags the XML content as
++	 * changed, under a PushReadToWrite()/PopWriteToRead() bracket.
++	 * @param node The <MSI> element to update.
++	 * @param value "Y" or "N".
++	 * @return void
++	 */
+ 	void SetAttributeInstalled(DOMElement* node, const char *value);
++
++	/**
++	 * Appends uninstallCmd to a shared, per-product-mode
++	 * Uninstall_all_utilities.bat file, de-duplicating against existing
++	 * content and silently giving up if the target path isn't writable.
++	 * Called only from pimMSIExec() -- OnInstall()'s API-installed packages
++	 * never get an entry here.
++	 * @param uninstallCmd The uninstall command line to record.
++	 * @param Converter Resolves property placeholders in the target path.
++	 * @return void
++	 */
+ 	void CreateBatchFileUninstallEntry(btkString &uninstallCmd, pimConvert &Converter);
++
++	/**
++	 * Maps a numeric MSI exit code to a message id, appends the
++	 * error/warning, and (for genuine failures) calls OnFailure() to
++	 * deselect the parent package. Used by pimMSIExec().
++	 * @param errorCode The msiexec.exe/MSI exit code.
++	 * @param map The <MSI> node's attribute map, for package-label prefixing.
++	 * @return void
++	 */
+ 	void ProcessErrorCode(int errorCode, DOMNamedNodeMap* map);
++
++	/**
++	 * Appends a pre-resolved message id (for non-numeric failure paths such
++	 * as a missing MSI file or a process-launch failure) and calls
++	 * OnFailure().
++	 * @param msg_id The message id to append.
++	 * @param map The <MSI> node's attribute map, for package-label prefixing.
++	 * @return void
++	 */
+ 	void ProcessErrorCode(ptc_intptr msg_id, DOMNamedNodeMap* map);
+ 
++	/**
++	 * Sets the linked <PACKAGE>'s install="N", the shared "persistently
++	 * deselect a failed package" mechanism.
++	 * @param map The failing <MSI> node's attribute map.
++	 * @return void
++	 */
+ 	void OnFailure(DOMNamedNodeMap *map);
+-	
++
+ protected:
++	/**
++	 * Thread entry point; dispatches to pimMSIExec() or OnInstall() based on
++	 * use_msiexec.
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * Launches msiexec.exe as an external child process for each eligible
++	 * <MSI> node, polling WaitForExit() every 2 seconds and checking
++	 * kill_msiexec each cycle. Dispatches the exit code via
++	 * ProcessErrorCode(int, ...); on success (0/3010/1641) marks
++	 * installed="Y" and appends to the uninstall batch file (subject to
++	 * name/product-mode exemptions).
++	 * @return void
++	 */
+ 	void pimMSIExec();
++
++	/**
++	 * Calls the MSI API directly in-process (pimMSIInstallFullUI/BasicUI/
++	 * Silent, chosen by the node's format attribute) for each eligible
++	 * <MSI> node, offering real progress ticks and Cancel() support. See
++	 * class-level doc for two confirmed bugs in this method: the dead
++	 * same_msihybrid skip, and the fallback_to_msiexec repeated-invocation
++	 * issue.
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * Standard thread teardown.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
+ 	btkString Source;
+@@ -49,14 +188,28 @@
+ 	double expected_installed_size;
+ 
+ public:
++	/**
++	 * Constructs a pimMSILoop bound to the given XML content, with
++	 * use_msiexec initialized to true (msiexec.exe path) and kill_msiexec
++	 * to false.
++	 * @param XMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimMSILoop(pimXmlFile *XMLContent) : pimLoop(XMLContent)
+ 	{
+ 		use_msiexec = true;
+ 		kill_msiexec = false;
+ 	}
+ 
++	/** @return true (always); declared for interface parity with other Loop types. */
+ 	bool IsInitialized() { return true; }
+ 
++	/**
++	 * Forwards to pimLoop::Cancel() ONLY when use_msiexec is false (the
++	 * MSI-API path). When use_msiexec is true (the default msiexec.exe
++	 * path), this is a silent no-op -- callers should check pimCanCancel()
++	 * first.
++	 * @return void
++	 */
+ 	void Cancel()
+ 	{
+ 		if (! use_msiexec)
+@@ -66,6 +219,16 @@
+ 		}
+ 	}
+ 
++	/**
++	 * Only effective when use_msiexec is true (msiexec.exe path): sets
++	 * kill_msiexec under kMutex, then busy-spins the CALLING thread (no
++	 * sleep between iterations) until pimMSIExec()'s own worker-thread loop
++	 * notices the flag (on its next 2-second WaitForExit cycle), terminates
++	 * the child process, and clears the flag. A total no-op when
++	 * use_msiexec is false -- there is no way to force-abort an in-progress
++	 * MSI-API install from this class.
++	 * @return void
++	 */
+ 	void Kill()
+ 	{
+ 		if (use_msiexec)
+@@ -88,15 +251,38 @@
+ 	/*
+ 	 * content that has attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Sets the base source directory used to resolve relative MSI paths.
++	 * @param in Source directory.
++	 * @return void
++	 */
+ 	void pimSetSource(btkString &in) { Source = (cStringT)in; }
++
++	/**
++	 * Sets the destination path (declared for parity with other Loop types).
++	 * @param in Destination path.
++	 * @return void
++	 */
+ 	void pimSetDestPath(btkFSEntry &in){ Dest = (cStringT)in; }
++
++	/**
++	 * Selects the execution strategy: true (default) launches msiexec.exe
++	 * as a child process; false calls the MSI API directly in-process.
++	 * @param tf New use_msiexec value.
++	 * @return void
++	 */
+ 	void pimSetUseMsiExec(bool tf = true) { use_msiexec = tf; }
++
++	/** @return !use_msiexec -- whether Cancel() actually does anything for the current strategy. */
+ 	bool pimCanCancel() { return !use_msiexec; }
+ 
+ 	// these are really ticks on the progress bar versus total ticks in the progress bar
+ 	// we don't get sizes out of the MSI api, just a X position on the progress bar
+ 	//
++	/** @return The current installed-size progress counter, thread-safe via SizeMutex. */
+ 	double pimGetInstalledSize();
++
++	/** @return The expected total-size progress counter, thread-safe via SizeMutex. */
+ 	double pimGetExpectedInstalledSize();
+ };
+ 

@@ -1,0 +1,249 @@
+--- a/pim_core/includes/pimLoop.h
++++ b/pim_core/includes/pimLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -15,6 +15,30 @@
+ #include <pimCore.h>
+ #include <pimXmlFile.h>
+ 
++/**
++ * Abstract base class for every threaded, cancelable install "step" in PIM
++ * (e.g. pimCopyLoop, pimMSILoop, pimSFXLoop, pimScriptLoop, pimShortcutLoop,
++ * pimRegEditLoop, pimServiceLoop, pimPsfLoop, pimDownloadLoop) and for
++ * pimEntitlement itself, which also derives from pimLoop so an entire
++ * product install/uninstall runs as one cancelable, pausable unit.
++ *
++ * Responsibilities:
++ * - Own the threaded execution contract (Execute/Cancel/Pause/Resume/Wait/Kill).
++ * - Own progress/completion state (mCancel/mDone/mPause/mInProgress) behind Mutex.
++ * - Accumulate newline-joined error/warning text reported by subclasses.
++ * - Hold the pimXmlFile this Loop instance operates against (xmlPtr), without
++ *   owning it.
++ *
++ * Dependencies:
++ * - thrThread (base class, external btk toolkit) supplies the OS thread mechanics.
++ * - thrMutex / thrSemaphore (external btk) guard shared state and back Pause/Resume.
++ * - pimXmlFile, whose own PreRead/PreWrite locking protects the underlying DOM
++ *   document across the multiple Loop threads that may share one entitlement's XML.
++ *
++ * Thread safety: mCancel/mDone/mPause/mInProgress and the Errors/Warnings buffers
++ * are read/written only under Mutex (recursive). Subclasses are responsible for
++ * polling IsCancelFlagSet()/IsPaused() from their own OnExecute() loop body.
++ */
+ class pimLoop : public thrThread
+ {
+ protected:
+@@ -29,51 +53,190 @@
+ protected:
+ 	thrMutex Mutex;
+ 
++	/**
++	 * Callback invoked by the thrThread framework when this Loop's worker
++	 * thread raises an unhandled exception.
++	 *
++	 * Responsibilities:
++	 * - Log the failure (including the current thread id) via LG_ERROR.
++	 * - Clear mInProgress.
++	 * - Terminate the process via btkCrash() -- this is not a recoverable path;
++	 *   a crash in any one Loop subclass takes down the whole installer.
++	 *
++	 * @param pszXMessage Optional exception message; NULL indicates a generic
++	 *        "crash in secondary thread" condition.
++	 * @return void
++	 */
+ 	void OnUnhandled(char *pszXMessage);
+ 
++	/**
++	 * Appends a literal error string to the mutex-guarded Errors buffer.
++	 *
++	 * @param str Error text to append.
++	 * @param add_newline When true (default), appends a trailing newline.
++	 * @param prefix_label When non-null, prepended as "<prefix_label> - " before str.
++	 * @return void
++	 */
+ 	void AppendError(const char *str, bool add_newline = true, const char *prefix_label = nullptr);
+ 
++	/**
++	 * Appends a localized error string (resolved via msgID_sput_buffer from
++	 * the given message id) to the mutex-guarded Errors buffer.
++	 *
++	 * @param msg_id Message-catalog id to resolve and append.
++	 * @param add_newline When true (default), appends a trailing newline.
++	 * @param prefix_label When non-null, prepended as "<prefix_label> - " before the resolved text.
++	 * @return void
++	 */
+ 	void AppendError(ptc_intptr msg_id, bool add_newline = true, const char *prefix_label = nullptr);
+-	
++
++	/**
++	 * Appends a literal warning string to the mutex-guarded Warnings buffer.
++	 * See AppendError(const char*, bool, const char*) for parameter semantics.
++	 *
++	 * @param str Warning text to append.
++	 * @param add_newline When true (default), appends a trailing newline.
++	 * @param prefix_label When non-null, prepended as "<prefix_label> - " before str.
++	 * @return void
++	 */
+ 	void AppendWarning(const char *str, bool add_newline = true, const char *prefix_label = nullptr);
+-	
++
++	/**
++	 * Appends a localized warning string (resolved via msgID_sput_buffer) to
++	 * the mutex-guarded Warnings buffer.
++	 *
++	 * @param msg_id Message-catalog id to resolve and append.
++	 * @param add_newline When true (default), appends a trailing newline.
++	 * @param prefix_label When non-null, prepended as "<prefix_label> - " before the resolved text.
++	 * @return void
++	 */
+ 	void AppendWarning(ptc_intptr msg_id, bool add_newline = true, const char *prefix_label = nullptr);
+ 
++	/**
++	 * Clears mInProgress under Mutex.
++	 *
++	 * @return void
++	 */
+ 	void ClearInProgress();
+-	
++
+ public:
++	/**
++	 * Constructs a pimLoop bound to the given XML document, with all
++	 * lifecycle flags (mCancel/mDone/mPause/mInProgress) initialized to false.
++	 *
++	 * @param XMLContent The product/entitlement XML this Loop will operate on.
++	 *        Not owned by this class.
++	 */
+ 	pimLoop(pimXmlFile *XMLContent);
+-	
++
++	/**
++	 * Repoints this Loop at a different XML document.
++	 *
++	 * @param XMLContent The new XML document to operate on. Not owned by this class.
++	 * @return void
++	 */
+ 	void SetXml(pimXmlFile *XMLContent);
+-	
++
++	/**
++	 * Resets lifecycle flags and the Errors/Warnings buffers, then spawns the
++	 * worker thread (via thrThread::Execute(thrAttached)) that runs this
++	 * subclass's OnExecute().
++	 *
++	 * @return void
++	 */
+ 	virtual void Execute();
+-	
++
++	/**
++	 * Requests cooperative cancellation: resumes the thread first (if paused,
++	 * so it can observe the cancel flag), then sets mCancel under Mutex.
++	 * The subclass's execution loop must poll IsCancelFlagSet() to honor this.
++	 *
++	 * @return void
++	 */
+ 	virtual void Cancel();
+-	
++
++	/**
++	 * @return true if Cancel() has been requested and not yet cleared.
++	 */
+ 	virtual bool IsCancelFlagSet();
+-	
++
++	/**
++	 * @return true if this Loop's worker thread is currently running.
++	 */
+ 	virtual bool IsInProgress();
+ 
++	/**
++	 * @return true if this Loop's worker thread has finished.
++	 */
+ 	virtual bool IsDone();
+-	
++
++	/**
++	 * Requests a pause: sets mPause under Mutex and lazily allocates pausePtr
++	 * if needed. The actual blocking (semaphore Decrement) happens in the
++	 * subclass's execution loop, not in this base class.
++	 *
++	 * @return void
++	 */
+ 	virtual void Pause();
+-	
++
++	/**
++	 * @return true if this Loop is currently paused.
++	 */
+ 	virtual bool IsPaused();
+-	
++
++	/**
++	 * Resumes a paused Loop by clearing mPause and incrementing pausePtr,
++	 * unblocking the worker thread's Decrement() wait.
++	 *
++	 * @return void
++	 */
+ 	virtual void Resume();
+-	
++
++	/**
++	 * @return true if the Errors buffer is non-empty.
++	 */
+ 	virtual bool HasErrors();
+-	
++
++	/**
++	 * Copies the accumulated error text out under Mutex.
++	 *
++	 * @param out Receives the current Errors buffer contents.
++	 * @return void
++	 */
+ 	virtual void GetErrors(btkString &out);
+-	
++
++	/**
++	 * @return true if the Warnings buffer is non-empty.
++	 */
+ 	virtual bool HasWarnings();
+-	
++
++	/**
++	 * Copies the accumulated warning text out under Mutex, optionally
++	 * stripping embedded "<a href=\"...\">" hyperlink markup.
++	 *
++	 * @param out Receives the current Warnings buffer contents.
++	 * @param remove_hyperlinks When true, strips "<a href=\"...\">" markup via regex.
++	 * @return void
++	 */
+ 	virtual void GetWarnings(btkString &out, bool remove_hyperlinks = false);
+-	
++
++	/**
++	 * Hard-stops the worker thread (thrThread::Terminate()) and, if the XML
++	 * write lock is still engaged on xmlPtr, releases it via PostWrite() so a
++	 * killed thread cannot leave the document permanently write-locked.
++	 *
++	 * @return void
++	 */
+ 	virtual void Kill();
+-	
++
++	/**
++	 * Blocks the calling thread until this Loop's worker thread finishes
++	 * (delegates to thrThread::Wait()).
++	 *
++	 * @return void
++	 */
+ 	virtual void Wait();
+-	
++
+ };
+ 
+ #endif

@@ -1,0 +1,97 @@
+# PIM Architecture — machine-readable summary.
+# Human-readable source of truth: docs/01_repository_inventory.md, docs/02_architecture_overview.md
+# Evidence scope: installmgr.zip archive only (see docs/01_repository_inventory.md §0 for gaps).
+# generated_from: source evidence only; no invented behavior.
+
+system:
+  name: "PIM (Parametric Installation Management)"
+  vendor: "PTC"
+  platform: "Windows, native C++"
+  purpose: >
+    In-house installer/install-manager for PTC's Creo, Mathcad, Windchill Workgroup
+    Manager (WGM), and related product lines. Parses product-definition XML,
+    resolves prerequisites, and executes a per-product pipeline of typed install
+    steps under a custom (non-MFC) UI.
+  corpus_completeness: PARTIAL
+  missing_from_archive:
+    - build_system_files (no Makefile/.vcxproj/.sln/CMake -- re-verified via exhaustive filename search in a later pass, see docs/01_repository_inventory.md §3/§8: zero matches for Makefile*/*.mk/CMakeLists*/*.vcxproj*/*.sln/*.cmake/SConstruct/*.gyp/build.xml/*.bat/*.sh)
+    - resource_files (.rc)
+    - btk_toolkit_source (external base class library; pervasive dependency)
+    - launcher_exe_source: [pim.exe, pim_rm.exe, pim_re.exe (inferred), pim_rl.exe (inferred)]
+    - "sample_product_xml_files (re-verified: find . -iname *.xml across the entire extracted tree returns zero matches)"
+    - test_files_or_ci_config
+
+modules:
+  - id: pim
+    kind: dll
+    role: "Top-level orchestration; exports the 3 Run entry points"
+    exported_via: pim/includes/exp_pim_dll.h
+    depends_on: [pim_core, pim_ui, pim_util]
+    doc: docs/modules/pim.md
+  - id: pim_core
+    kind: static_lib_linked_into_pim
+    role: "Install engine: XML model, entitlement/session state, Loop step family, logging"
+    depends_on: [pim_util]
+    doc: docs/modules/pim_core.md
+  - id: pim_ui
+    kind: static_lib_linked_into_pim
+    role: "Dialogs on a custom (non-MFC) UI toolkit"
+    depends_on: [pim_core, pim_util]
+    doc: docs/modules/pim_ui.md
+    coverage_note: "lighter pass than the other 3 modules; ~50 dialog files not individually traced"
+  - id: pim_util
+    kind: static_lib_linked_into_pim
+    role: "OS/MSI/CAB/FlexNet/registry-bookkeeping utilities; bottom of the stack"
+    depends_on: []
+    doc: docs/modules/pim_util.md
+
+module_dependency_direction: "pim -> pim_ui -> pim_core -> pim_util (one-directional; no file in pim_util was observed including a pim_core or pim_ui header)"
+
+external_dependencies:
+  - name: btk_toolkit
+    role: "Foundational string/filesystem/threading/collection/logging/UI-widget layer used pervasively"
+    included_in_archive: PARTIAL   # only btkunzip.h/.cxx were supplied, separately, this session
+  - name: xerces_c
+    role: "DOM XML parsing/serialization for every XML document type"
+    used_by: [pim_core.pimXmlFile]
+  - name: libzip
+    role: "ZIP archive reading, wrapped by btk's btkUnzip"
+    used_by: [pim_core.pimCopyLoop]
+  - name: windows_installer_msi
+    role: "MSI package install/query"
+    used_by: [pim_core.pimMSILoop, pim_util.pimMSI]
+  - name: windows_cabinet_fdi
+    role: "Legacy .cab extraction (superseded at the pimCopyLoop call site this session; pim_util.pimCab.cxx itself untouched)"
+    used_by: [pim_util.pimCab]
+  - name: flexnet_licensing
+    role: "License source discovery/validation"
+    used_by: [pim_util.pimFLEXnet]
+  - name: win32_api
+    role: "Registry, process, OS-version APIs"
+    used_by: [pim_core.pimRegEditLoop, pim_util.pimRegisterProduct, pim_util.pimWindows]
+  - name: unnamed_ptc_platform_dll
+    role: "Backs pim/includes/imp_pim_dll.h imports (service control, i18n, exit hooks, authorize_main)"
+    included_in_archive: false
+    identity: UNKNOWN
+
+entry_points:
+  - name: pim.exe
+    mode: install
+    calls: pimInstallerRun
+    source_included: false
+  - name: pim_rm.exe
+    mode: uninstall
+    calls: pimInstallerRun   # same function, uninstall_mode passed through pimUIInit(true)
+    source_included: false
+  - name: pim_re.exe
+    mode: reconfigure
+    calls: UNKNOWN   # inferred name only, from revision-history comments
+    source_included: false
+  - name: pim_rl.exe
+    mode: [renew_license, frictionless_trial]
+    calls: [pimRenewLicenseRun, pimFrictionlessTrialRun]
+    source_included: false
+
+doc_refs:
+  - docs/01_repository_inventory.md
+  - docs/02_architecture_overview.md

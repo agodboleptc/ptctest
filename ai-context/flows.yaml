@@ -1,0 +1,103 @@
+# Execution flows. Source of truth: docs/03_application_startup.md, docs/04_installation_flow.md,
+# docs/05_prerequisite_framework.md.
+
+flows:
+  application_startup:
+    doc: docs/03_application_startup.md
+    entry_functions: [pimInstallerRun, pimFrictionlessTrialRun, pimRenewLicenseRun]
+    shared_init_sequence:
+      - btki18nSetup            # external
+      - pimXmlInit              # Xerces init, idempotent
+      - pimCommandLineArgs      # CLI parse
+      - pimGeneralInit          # EnableThreading, env setup, msg_init, license.res
+      - pimBrowserInit          # InitGetCredentialsAPI
+      - InitLog
+      - "pimUIInit(uninstall_mode)"
+    pimInstallerRun_sequence:
+      - pimWindowsPathTest
+      - LocatePhysicalImage (branch point: media vs network install)
+      - "construct pimSessionInfo"
+      - "media branch: enumerate *.xml, filter by image.xml reference + trial/allow-list rules, SessionInfo.AddEntitlement per file"
+      - "derive product mode from family flags (FlexOnly/Schematics/Mathcad/WGM/ARPlugin/CreoHelp/MKS)"
+      - "network branch: TestCommunicationToPTC unless reconfigure mode"
+      - "construct pimInstallMgrDlg; Initialize/Refresh/Display"
+      - "Wait() on every entitlement thread"
+      - "SessionInfo.PrepareForShutdown(); pimUITerminate; ptc_exit_run; btki18nCleanup"
+    divergence:
+      pimFrictionlessTrialRun: "decodes obfuscated scn/email/psf CLI args; shows pimFrictionlessTrialDlg instead of pimInstallMgrDlg; no entitlement/image scanning"
+      pimRenewLicenseRun: "simplest; shows rpimDlg directly; no entitlement loading"
+
+  entitlement_onexecute_dispatch:
+    doc: docs/04_installation_flow.md §1
+    function: pimEntitlement::OnExecute
+    steps:
+      - {check: "!in_reconfigure && !do_rollback && HasPrerequisite() && !HasPrerequisitesInstallSucceeded()", action: "return (wait for prerequisites externally)"}
+      - {check: "in_reconfigure", action: "OnReconfigure(); return"}
+      - {action: "MSI 64-bit ProgramFiles path fixup if applicable"}
+      - {action: "IsMSIHybrid && AreWeAnUpdate: set [LP]=[MSIINSTALLPATH]"}
+      - {check: "UpdateOfProduct != NULL", true_branch: OnUpdate, false_branch: "InitCommand(NULL) + InitSimulateLicenses if declared"}
+      - {check: "!do_rollback", action: OnInstall}
+      - {check: "do_rollback || do_install_rollback", action: "OnRollback(do_install_rollback)"}
+
+  entitlement_install_pipeline:
+    doc: docs/04_installation_flow.md §2
+    function: pimEntitlement::OnInstall
+    note: "each stage individually skippable via an XML property; each mandatory-stage failure aborts the rest"
+    stages_in_order:
+      - {name: upgrade_precleanup, condition: "UpdateOfProduct != NULL", detail: "docs/04_installation_flow.md §3"}
+      - {name: PreInstall_custom_actions, skip_flag: null}
+      - {name: pre_copy_msi, condition: "!HasMSI && !HasEngNotebook, OR NoPreCopyMSI set"}
+      - {name: PreMSIConfigure_custom_actions, condition: "HasMSIInstall || HasEngNotebookInstall"}
+      - {name: install_msi_precopy, condition: "HasMSI/EngNotebook AND !NoPreCopyMSI AND (update-or-new) AND run_msi"}
+      - {name: copy_step, skip_flag: NoCopyStep}
+      - {name: install_msi_postcopy, condition: "HasMSI/EngNotebook AND !NoPostCopyMSI AND (update-or-new)"}
+      - {name: PostCopy_custom_actions, skip_flag: null}
+      - {name: registry_changes, skip_flag: NoRegistryActions, implementation: "pimRegEdit singleton"}
+      - {name: scripts, skip_flag: NoScripts}
+      - {name: services, skip_flag: NoServices}
+      - {name: psf, skip_flag: NoPSF}
+      - {name: shortcuts, skip_flag: NoShortcuts, additional_condition: "!pimGetCreoNGCRIMode()"}
+      - {name: PostInstall_custom_actions, skip_flag: null}
+      - {name: PostUpgrade_custom_actions, condition: "UpdateOfProduct != NULL"}
+      - {name: finalize_status, detail: "Complete / CompleteWithWarnings / CompleteWithErrors based on CA_WARNINGS[_WITH_ERROR] properties"}
+    special_case: "PIM_MATHCAD_MODE && !pimGetPrimeMSIRunStatus() && IsMSIHybrid() forces run_msi=false"
+
+  entitlement_rollback:
+    doc: docs/04_installation_flow.md §6
+    function: pimEntitlement::OnRollback
+    steps:
+      - PreUninstall_custom_actions
+      - UninstallShortcuts
+      - "(untraced middle section — presumed to mirror install pipeline in reverse, NOT CONFIRMED)"
+      - {name: registry_rollback, implementation: "pimRegEdit::GetInstance().Uninstall(xmlPtr) — SAME SINGLETON as forward install"}
+    caveat: "ROLLBACK_CANCELLED_INSTALL macro guards do_install_rollback=true at every cancel point in OnInstall; NOT #define'd anywhere in this archive — rollback-on-cancel may be dead code in the actual build"
+
+  prerequisite_satisfaction_wait:
+    doc: docs/05_prerequisite_framework.md §5
+    function: pimEntitlement::HasPrerequisitesInstallSucceeded
+    pattern: "blocking Sleep(1) busy-wait loop on the calling (dependent) thread"
+    per_prerequisite_logic:
+      - {condition: "ptr->IsDone() || !ptr->GetInstallMe()", action: "re-verify via IsPrerequisiteSatisfied(true); hard failure -> pimHitError(PIM_PREQUISITE_NOT_SATISFIED), return false, UNLESS soft prerequisite"}
+      - {condition: "IsCancelFlagSet() on the DEPENDENT", action: "status=Cancelled, return false. NOTE: does NOT cancel the prerequisite's own thread (dead code: //ptr->Cancel();)"}
+      - {condition: "otherwise", action: "status=pending prerequisite, loop again"}
+
+  msi_exit_code_handling:
+    doc: docs/11_troubleshooting.md §1 / pim_core/pim_core_src/pimMSILoop.cxx
+    function: pimMSILoop::ProcessErrorCode
+    codes:
+      - {code: 0, meaning: success}
+      - {code: 3010, meaning: "ERROR_SUCCESS_REBOOT_REQUIRED", treated_as: success_with_warning}
+      - {code: 1641, meaning: "ERROR_SUCCESS_REBOOT_INITIATED", treated_as: success_with_warning}
+      - {code: 1602, meaning: "user cancel", treated_as: cancel}
+      - {code: 1259, meaning: "AppHelp block / non-continue", treated_as: cancel}
+      - {code: 1618, meaning: "another install in progress", treated_as: cancel, specific_message: true}
+      - {code: 1637, treated_as: error, specific_message: true}
+      - {code: 1633, meaning: "platform unsupported", treated_as: error, specific_message: true}
+      - {code: 1632, meaning: "temp dir unwritable", treated_as: error, specific_message: true}
+      - {code: 1625, meaning: "transform rejected by policy", treated_as: error, specific_message: true}
+      - {code: 1619, meaning: "package open failed", treated_as: error, specific_message: true}
+      - {code: 1613, meaning: "unsupported package version", treated_as: error, specific_message: true}
+      - {code: 1620, meaning: "invalid package", treated_as: error, specific_message: true}
+      - {code: 1603, meaning: "general install failure", treated_as: error, specific_message: true}
+      - {code: other, treated_as: error, message: pimUIInstallStatusError_User_msg}
+    side_effect_on_any_error: "OnFailure() sets the corresponding <PACKAGE install=\"N\"> — persistently deselects the failed package"

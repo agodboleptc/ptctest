@@ -1,0 +1,191 @@
+--- a/pim_core/includes/pimServiceLoop.h
++++ b/pim_core/includes/pimServiceLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -12,26 +12,161 @@
+ #include <pimXmlFile.h>
+ #include <pimConvert.h>
+ 
++/**
++ * Install-step (pimLoop subclass) that installs, removes, starts, and stops
++ * Windows services on behalf of the currently-selected product XML.
++ *
++ * Responsibilities:
++ * - Iterate <SERVICE> elements and, depending on the current action (see
++ *   below), create+register, remove, start, or stop the named service.
++ * - Delegate the actual service-control calls to external ginst_* functions
++ *   (ginst_install_service, ginst_remove_service, ginst_is_service_installed,
++ *   ginst_is_service_running) exported by the unidentified PTC platform DLL
++ *   declared in imp_pim_dll.h.
++ *
++ * Structural oddity: unlike every other Loop subclass, WHICH action to
++ * perform (install/start/stop) is not passed as a per-call parameter or
++ * constructor argument. It is read from pimServices::serviceAction, a
++ * class-STATIC field on this Loop's singleton owner, set immediately before
++ * Execute() is called. This makes the two objects (pimServices and
++ * pimServiceLoop) tightly, non-obviously coupled -- do not add a second
++ * concurrent caller of pimServices::GetInstance() without accounting for
++ * this shared static.
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - pimConvert (property resolution for install/uninstall/start/stop command
++ *   strings).
++ * - External ginst_install_service/ginst_remove_service/
++ *   ginst_is_service_installed/ginst_is_service_running (imp_pim_dll.h;
++ *   owning DLL identity UNKNOWN, but these concrete call sites are
++ *   confirmed).
++ *
++ * Owned by: pimServices (pim_core/includes/pimServices.h), a process-wide
++ * singleton (GetInstance()) -- NOT a per-entitlement object. Only one
++ * service create/remove/start/stop operation can be in flight across the
++ * whole process at a time.
++ */
+ class pimServiceLoop : public pimLoop
+ {
+ private:
+ 	int do_rollback;
+ protected:
++	/**
++	 * Thread entry point; dispatches on the current pimServices::serviceAction
++	 * (read via pimServices::getServiceAction()) to CreateServicesFromXml(),
++	 * StartServicesFromXml(), or StopServicesFromXml() -- or to OnRollback()
++	 * when do_rollback is set.
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * Legacy/default install dispatch; delegates to CreateServicesFromXml()
++	 * for the action-based flow.
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * Removes services previously marked installed="Y" via RemoveService().
++	 * @return void
++	 */
+ 	void OnRollback();
++
++	/**
++	 * Standard thread teardown.
++	 * @return void
++	 */
+ 	void OnTerminate();
++
++	/**
++	 * Iterates <SERVICE> nodes and calls CreateService() for each eligible
++	 * one, marking installed="Y" on success.
++	 * @return void
++	 */
+ 	void CreateServicesFromXml();
++
++	/**
++	 * Iterates <SERVICE> nodes and calls StartService() for each eligible
++	 * one.
++	 * @return void
++	 */
+ 	void StartServicesFromXml();
++
++	/**
++	 * Iterates <SERVICE> nodes and calls StopService() for each eligible
++	 * one.
++	 * @return void
++	 */
+ 	void StopServicesFromXml();
++
++	/**
++	 * Registers a Windows service via the external ginst_install_service(),
++	 * skipping the call (returning success) if HasService() reports the
++	 * service is already registered.
++	 *
++	 * @param name Service name.
++	 * @param install_cmd Command line used to register the service.
++	 * @param exe Target executable path for the service.
++	 * @param Converter Resolves property placeholders in install_cmd/exe.
++	 * @return true on success (including already-installed).
++	 */
+ 	bool CreateService(const char *name, const char *install_cmd, const char *exe, pimConvert *);
++
++	/**
++	 * Unregisters a Windows service via the external ginst_remove_service().
++	 *
++	 * @param name Service name.
++	 * @param uninstall_cmd Command line used to unregister the service.
++	 * @param Converter Resolves property placeholders in uninstall_cmd.
++	 * @return true on success.
++	 */
+ 	bool RemoveService(const char *name, const char *uninstall_cmd, pimConvert *);
++
++	/**
++	 * @param name Service name.
++	 * @return true if the named service is registered, per the external
++	 *   ginst_is_service_installed().
++	 */
+ 	bool HasService(const char *name);
++
++	/**
++	 * @param name Service name.
++	 * @return true if the named service is currently running, per the
++	 *   external ginst_is_service_running().
++	 */
+ 	bool IsRunning(const char *name);
++
++	/**
++	 * Starts a previously-registered service, skipping the call if
++	 * IsRunning() already reports it running.
++	 *
++	 * @param name Service name.
++	 * @param start_cmd Command used to start the service.
++	 * @param Converter Resolves property placeholders in start_cmd.
++	 * @return true on success (including already-running).
++	 */
+ 	bool StartService(const char *name, const char *start_cmd, pimConvert *);
++
++	/**
++	 * Stops a running service.
++	 *
++	 * @param name Service name.
++	 * @param stop_cmd Command used to stop the service.
++	 * @param Converter Resolves property placeholders in stop_cmd.
++	 * @return true on success.
++	 */
+ 	bool StopService(const char *name, const char *stop_cmd, pimConvert *);
+ public:
++	/** Grants pimServices direct access to this class's protected members. */
+ 	friend class pimServices;
++
++	/**
++	 * Constructs a pimServiceLoop bound to the given XML content, with
++	 * do_rollback initialized to false.
++	 * @param ScriptXMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimServiceLoop(pimXmlFile *ScriptXMLContent) : pimLoop(ScriptXMLContent)
+ 	{
+ 		do_rollback = false;
+@@ -40,6 +175,12 @@
+ 	/*
+ 	 * scripts that have attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Marks this Loop to run OnRollback() (remove installed="Y" services)
++	 * instead of the action-based dispatch when Execute()d.
++	 * @param tf New rollback-mode flag value.
++	 * @return void
++	 */
+ 	void SetRollback(bool tf) { do_rollback = tf; }
+ 
+ #if 0
+@@ -50,4 +191,4 @@
+ #endif
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif

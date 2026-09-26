@@ -1,0 +1,172 @@
+--- a/pim_core/includes/pimMSICopier.h
++++ b/pim_core/includes/pimMSICopier.h
+@@ -1,11 +1,11 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Apr-12 P-20-03   TWH   $$1    Created
+   02-May-12 P-20-04   TWH   $$2    patch from P10
+   16-Feb-15 P-30-02   MTH   $$3   closing PIM dialog wait for MSI cancel operation
+-  19-Mar-24 Q-12-04   RCH   $$4   Corrected warning tooltip
++  19-Mar-24 Q-12-04   RCH   $$4    Corrected warning tooltip
+ 
+ \*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/
+ #ifndef PIMMSICOPIER_H
+@@ -15,6 +15,29 @@
+ #include <threadlibcxx.h>
+ #include <pimMSILoop.h>
+ 
++/**
++ * Process-wide singleton "owner" wrapper around pimMSILoop, the install step
++ * that drives Windows Installer (msiexec/MSI API) package installs. One of
++ * 7 near-identical Loop-owner wrapper singletons in pim_core.
++ *
++ * Locking contract DIVERGES from its 5 TryLock-based siblings
++ * (pimCopier/pimShortcuts/pimRegEdit/pimServices/pimDownloader): this class
++ * has no internal xmlMutex at all. Instead it gates entry via the external
++ * pimOKToRunMsiexec()/pimFreeMsiexec() functions (pim_util), which this
++ * class SHARES with pimSFXCopier -- confirmed: both classes call the exact
++ * same functions. Consequence: at most one of {an MSI install via this
++ * class, an SFX install via pimSFXCopier} can be in flight process-wide at
++ * any moment. pimOKToRunMsiexec() additionally probes the Windows Installer
++ * "...\\Installer\\InProgress" registry key, so this gate can also fail
++ * closed due to an MSI operation running OUTSIDE this process entirely.
++ *
++ * Unlike its siblings, Status()'s "done" branch does NOT delete the owned
++ * pimMSILoop or release the gate -- cleanup is caller-driven via Release()/
++ * Kill(). A caller that never calls Release() after a normal completion
++ * leaves the shared MSI/SFX gate held indefinitely.
++ *
++ * Sole caller in this codebase: pimEntitlement.
++ */
+ class pimMSICopier
+ {
+ private:
+@@ -35,12 +58,21 @@
+ 	pimMSILoop *MSILoop;
+ 
+ public:
++	/** @return The singleton instance, constructing it on first call. */
+ 	static pimMSICopier& GetInstance();
+ 
+ protected:
+ 	pimMSICopier();
+ 	~pimMSICopier(){}
+ 
++	/**
++	 * Shared implementation behind MSIInstall(). Gated by pimOKToRunMsiexec()
++	 * (not a member mutex). Resolves dest via [LP], source via cachedir (or
++	 * [SOURCE] if NoDownloadSupport); reads MSIVERSION_PROPERTY to decide
++	 * pimSetUseMsiExec(), which an explicit USE_MSIEXEC XML property can
++	 * override. Constructs and Execute()s a pimMSILoop asynchronously.
++	 * @return true if the gate was acquired and the install started; false if busy.
++	 */
+ 	int MSICopy_low(pimXmlFile *);
+ 
+ private:
+@@ -58,11 +90,16 @@
+ 		Error
+ 	};
+ 
+-	// these use TRYLock 
++	// these use TRYLock
+ 	// return 1 if successfull and Download will happen
+ 	// return 0 if you should try again after a sleep
+-	// return negative if you should not try again 
+-	// 
++	// return negative if you should not try again
++	//
++	/**
++	 * Starts an MSI install. Non-blocking; delegates to MSICopy_low().
++	 * @return 1 if started; 0 if the shared MSI/SFX gate is busy (PIM-internal
++	 *   or an external msiexec); negative on error.
++	 */
+ 	int MSIInstall(pimXmlFile *);
+ 
+ 	// After Download() starts returns call Status
+@@ -70,39 +107,81 @@
+ 	// OUTPUTS:
+ 	// percent_downloaded 0 - 100
+ 	// estimate_remaining in seconds
+-	CopyStatus Status(int &percent_Copied, btkTimeval &estimate_remaining);
++	/**
++	 * Polls the install's progress. Distinguishes CancelIdle (MSI process
++	 * finished after being cancelled) from Idle (clean finish). Does NOT
++	 * delete the owned pimMSILoop or release the gate on completion -- call
++	 * Release() explicitly once done inspecting the terminal status.
++	 * @param percent_downloaded Receives 0-100 percent-installed estimate.
++	 * @param estimate_remaining Receives estimated remaining time.
++	 * @return Current CopyStatus.
++	 */
++	CopyStatus Status(int &percent_downloaded, btkTimeval &estimate_remaining);
+ 
+ 	// call only after IsDone && Status returns Idle
++	/** @return The final installed size. */
+ 	double GetCopiedSize() { return copy_total; }
+ 
+ 	// Put into a hold after the current download file
+ 	// completes
++	/** Sets a caller-facing pause_flag reported by Status(); does not itself pause the install thread. */
+ 	void Pause();
+ 
+ 	// Resume Pause
++	/** Clears pause_flag. */
+ 	void Resume();
+ 
+-	// Cancel - set cancel flag to stop after current download file 
++	// Cancel - set cancel flag to stop after current download file
+ 	// and release/reset all flags so another thread could start
++	/**
++	 * Sets cancel_flag AND calls the owned pimMSILoop's Cancel() directly.
++	 * Note: does not null-check the Loop pointer first.
++	 * @return void
++	 */
+ 	void Cancel();
+ 
+ 	// Release/reset all flags killing anything in progress
++	/**
++	 * If an install is in progress, kills the owned pimMSILoop, deletes it,
++	 * and calls pimFreeMsiexec() to release the shared MSI/SFX gate.
++	 * @return void
++	 */
+ 	void Kill();
+ 
+ 	// Force Release - call if we have to release our use of the
+ 	// instance before we actually call "Execute"
++	/** Calls only pimFreeMsiexec(); does not touch the owned pimMSILoop. */
+ 	void ForceRelease();
+ 
+ 	// Release - call after we check for errors/warnings.
+ 	//
++	/**
++	 * Deletes the owned pimMSILoop (unconditionally, no done-check) and calls
++	 * pimFreeMsiexec(). The only path that frees both after a normal
++	 * completion, since Status()'s done branch does not.
++	 * @return void
++	 */
+ 	void Release();
+ 
++	/** @return true if the owned pimMSILoop reports errors. */
+ 	bool HasErrors();
+ 
++	/**
++	 * Proxies to the owned pimMSILoop's GetErrors().
++	 * @param out Receives the accumulated error text.
++	 * @return void
++	 */
+ 	void GetErrors(btkString &out);
+ 
++	/** @return true if the owned pimMSILoop reports warnings. */
+ 	bool HasWarnings();
+ 
++	/**
++	 * Proxies to the owned pimMSILoop's GetWarnings().
++	 * @param out Receives the accumulated warning text.
++	 * @param remove_hyperlinks Strips hyperlink markup from the text if true.
++	 * @return void
++	 */
+ 	void GetWarnings(btkString &out, bool remove_hyperlinks = false);
+ 
+ };

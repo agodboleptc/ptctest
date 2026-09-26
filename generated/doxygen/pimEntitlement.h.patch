@@ -1,0 +1,841 @@
+--- a/pim_core/includes/pimEntitlement.h
++++ b/pim_core/includes/pimEntitlement.h
+@@ -11,8 +11,8 @@
+   23-Jan-12 P-10-16   TWH   $$7    Add pimEntDlBackup; Download support
+   02-Feb-12 P-10-16   TWH   $$8    Update for reconfigure
+   09-Feb-12 P-10-17   TWH   $$9    Add msi bool flags
+-  13-Feb-12 P-10-17   TWH   $$10   Add update_version, update_shipcode 
+-  15-Feb-12 P-10-17   TWH   $$11   Add update_from_path 
++  13-Feb-12 P-10-17   TWH   $$10   Add update_version, update_shipcode
++  15-Feb-12 P-10-17   TWH   $$11   Add update_from_path
+   07-Mar-12 P-10-17   TWH   $$12   FCS bug fix
+   06-Apr-12 P-20-03   TWH          Add updatemediaurls
+   06-Apr-12 P-20-03   TWH   $$13   Comment out some MSI code
+@@ -66,12 +66,22 @@
+ #include<pimSessionInfo.h>
+ 
+ class pimXmlFile;
++/**
++ * Backup of one media ID's download-URL XML state, kept so download URLs
++ * can be restored/regenerated if they time out and must be regenerated
++ * (see pimEntitlement::UpdateMediaUrls()).
++ */
+ class pimEntDlBackup
+ {
+ private:
+     btkString MediaID, UrlRoot;
+     pimXmlFile* EntXml;
+ public:
++    /**
++     * @param id Media identifier this backup is keyed on.
++     * @param root The download URL root path at backup time.
++     * @param E The associated entitlement XML (not owned).
++     */
+     pimEntDlBackup(const char* id, const char* root, pimXmlFile* E)
+     {
+         if (id) MediaID = id;
+@@ -80,8 +90,17 @@
+     }
+     ~pimEntDlBackup() {}
+ 
++    /**
++     * @return The media ID this backup is keyed on.
++     */
+     const char* GetID() const { return MediaID; }
++    /**
++     * @return The backed-up download URL root path.
++     */
+     const char* GetRoot() const { return UrlRoot; }
++    /**
++     * @return The associated entitlement XML document.
++     */
+     pimXmlFile* GetXml() { return EntXml; }
+ };
+ 
+@@ -97,6 +116,52 @@
+ class pimPTCLicenseGet;
+ typedef btkMap <char*, pimEntitlement*> PreRequisiteMap;
+ 
++/**
++ * Represents one installable product (an "entitlement"), backed by one
++ * product-definition XML file, and orchestrates its entire lifecycle:
++ * install, update, reconfigure, uninstall, and rollback. Derives from
++ * pimLoop so an entire product install/uninstall runs as one cancelable,
++ * pausable, threaded unit -- the CAB/ZIP-copy, MSI, registry, script,
++ * service, PSF, and shortcut operations underneath it are sub-steps this
++ * class drives via owned wrapper objects (pimCopier, and by the same
++ * pattern pimMSICopier, pimSFXCopier, pimShortcuts, pimRegEdit,
++ * pimServices, pimDownloader) or transient Loop instances
++ * (pimScriptLoop/pimPsfLoop).
++ *
++ * Responsibilities:
++ * - Identify itself (ID/Tag/Pref/PrimaryLicensePrefix/Family/ParentEntitlement/ARP),
++ *   derived from the product XML during Init().
++ * - Drive the install pipeline (OnInstall/OnUpdate/OnReconfigure/OnRollback
++ *   and the StartCopy/InstallMSI/ApplyRegistryChanges/InstallScripts/
++ *   PerformServiceAction/InstallPSF/InstallShortcuts steps).
++ * - Own the prerequisite graph between pimEntitlement instances (hard and
++ *   soft prerequisites).
++ * - Track update/upgrade relationships to a previously-installed version.
++ * - Track web-download backup state for URL rewriting during network installs.
++ * - Report progress/size/status to the UI.
++ * - Manage license-source/feature lists written into the product's PSF entry.
++ * - Manage Quality Agent opt-in/requirement flags.
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - pimCopier / pimServices (owned sub-step wrappers).
++ * - pimSessionInfo (back-references for session-wide state such as license sources).
++ * - pimConvert / SetupConverter (resolves XML property placeholders like [INSTALLBASE]).
++ * - pimXmlFile (the product's own definition document, inherited as xmlPtr from pimLoop).
++ *
++ * Ownership: created by pimSessionInfo::AddEntitlement() and held in its
++ * EntitlementArray/InstalledArray for the session's lifetime. Prerequisite
++ * pointers in PreRequisitesToHandle reference sibling entitlements owned
++ * elsewhere -- they are not owned by this class.
++ *
++ * Thread safety: inherits pimLoop's mutex-guarded lifecycle flags; adds its
++ * own separate PctMutex specifically for progress counters
++ * (total_pct_done/download_pct_done), so progress and done/cancel state are
++ * independently synchronized.
++ *
++ * friend class upimDlg; friend class upimSilentProgress; -- these UI
++ * classes access private members directly, bypassing the public API.
++ */
+ class pimEntitlement : public pimLoop
+ {
+ private:
+@@ -142,40 +207,222 @@
+     // PreRequisite
+     PreRequisiteMap PreRequisitesToHandle;
+     StringXArray SoftPreRequisites;
+-	
++
+ protected:
++    /**
++     * Thread entry point (invoked via pimLoop::Execute()); dispatches to
++     * OnInstall/OnUpdate/OnReconfigure/OnRollback depending on the mode
++     * flags set before Execute() was called.
++     *
++     * @return void
++     */
+     void OnExecute();
++    /**
++     * Update-existing-install path.
++     *
++     * @param update_cdsections When true, also refreshes CDSECTION entries during the update.
++     * @return void
++     */
+     void OnUpdate(bool update_cdsections = true);
++    /**
++     * Recomputes size estimates, optionally refreshing CDSECTION entries first.
++     *
++     * @param update_cdsections When true, refreshes CDSECTION entries before recomputing sizes.
++     * @return void
++     */
+     void UpdateSizes(bool update_cdsections = true);
++    /**
++     * Fresh-install path: drives StartCopy/InstallMSI/ApplyRegistryChanges/
++     * InstallScripts/PerformServiceAction/InstallPSF/InstallShortcuts in sequence.
++     *
++     * @return void
++     */
+     void OnInstall();
++    /**
++     * Runs XML-declared custom actions registered for a given lifecycle point during install.
++     *
++     * @param when The named lifecycle point (e.g. before/after a given step) to run actions for.
++     * @param return_on_errors When true, stops and returns on the first action error.
++     * @param check_cancel When true, checks the cancel flag between actions.
++     * @return true if all actions ran without error (or, if return_on_errors is false, always true).
++     */
+     bool OnInstallCustomActions(const char* when, bool return_on_errors = false, bool check_cancel = true);
++    /**
++     * Reconfigure path (re-applies settings to an already-installed product).
++     * Fully traced, pim_core_src/pimEntitlement.cxx:6866-7222. Stage order:
++     * optional RollbackMe-driven teardown of the previous config (Services
++     * stop / Shortcuts remove / PSF rollback / Scripts rollback, each gated
++     * by a No* property read off the ORIGINAL as-shipped .p.xml) ->
++     * OnInstallCustomActions("PreReconfigure") -> PTC install-record update
++     * (QualityAgentOptIn) -> optional cache-file relocation (NoLPXmlLog
++     * gated) -> Scripts recreate -> PSF recreate -> Services start ->
++     * OnInstallCustomActions("PostReconfigure") -> Shortcuts recreate.
++     *
++     * CONFIRMED BUG, HIGH SEVERITY: the function's very first block
++     * (:6880-6896) computes RollbackMe's path by taking a local copy of
++     * xmlPtr's own CURRENT cache-file path (pimGetAppData/pim/<name>.xml)
++     * and, purely as a side effect of extracting its bare filename via
++     * GetTail(), unconditionally Erase()s (deletes) that cache file from
++     * disk first -- there is no functional need to delete the file just to
++     * read its own filename. xmlPtr's own file-path member is unaffected
++     * (a separate local copy is erased), so the file is only restored once
++     * xmlPtr->DoSave() next runs. 2 confirmed early-return paths leave it
++     * permanently deleted: PerformServiceAction(StopAction) failing
++     * (:6921-6925, no DoSave() before the return), and
++     * OnInstallCustomActions("PreReconfigure") failing (:7023-7024,
++     * likewise no DoSave() before the return -- reachable via an ordinary
++     * custom-action failure, no cancellation needed). Confirmed by direct
++     * contrast: OnRollback()'s own mirror-image cache-relocation block has
++     * no such Erase() side effect. See docs/classes/pimEntitlement.md's
++     * Risk Analysis.
++     * @return void
++     */
+     void OnReconfigure();
++    /**
++     * Runs XML-declared custom actions registered for a given lifecycle point during uninstall.
++     *
++     * @param when The named lifecycle point to run actions for.
++     * @param return_on_errors When true, stops and returns on the first action error.
++     * @param check_cancel When true, checks the cancel flag between actions.
++     * @return true if all actions ran without error (or, if return_on_errors is false, always true).
++     */
+     bool OnUninstallCustomActions(const char* when, bool return_on_errors = false, bool check_cancel = true);
++    /**
++     * Rolls back a partially-completed install (or an explicit rollback request).
++     * Fully traced, pim_core_src/pimEntitlement.cxx:7287-7565. Confirmed
++     * stage order (mirrors OnInstall()'s stage list in reverse):
++     * OnUninstallCustomActions("PreUninstall") [failure only logged, does
++     * NOT abort the rest of rollback -- contrast with OnReconfigure()'s
++     * fail-fast custom-actions handling] -> optional cache-location reset
++     * back to Application Data (NoLPXmlLog gated, confirmed no Erase()
++     * side effect, unlike OnReconfigure()'s equivalent block) ->
++     * UninstallShortcuts() -> PSF rollback -> Scripts rollback -> Services
++     * uninstall -> RegEdit uninstall -> Copier rollback/uninstall (branches
++     * on from_during_install) -> PTC install-record removal ->
++     * uninstall-registry-key removal -> (from_during_install only) empty
++     * "Common Files" directory cleanup, but only for the creobase.xml
++     * entitlement.
++     *
++     * Confirmed exactly 2 from_during_install-specific branches exist in
++     * this function (Copier's Rollback() vs Uninstall() method choice, and
++     * the final directory-cleanup gate). Confirmed this function has ZERO
++     * early-return points -- a single, uninterrupted sequential run to
++     * completion regardless of any individual stage's outcome, unlike
++     * OnInstall()/OnReconfigure()'s many early exits. See
++     * docs/classes/pimEntitlement.md's Risk Analysis.
++     *
++     * @param from_during_install true if invoked due to a failure mid-install; false for an explicit rollback.
++     * @return void
++     */
+     void OnRollback(bool from_during_install = false);
+     //void OnMsiAdvInstall();
+     //void OnMsiExecInstall();
+     //void OnMsiInstall();
++    /**
++     * Thread teardown for this entitlement's install/uninstall thread.
++     * @return void
++     */
+     void OnTerminate();
+ 
++    /**
++     * Internal update-detection helper backing the public AreWeAnUpdate(bool).
++     *
++     * @param out_name Receives the name of the product being updated from.
++     * @param out_ver Receives its version.
++     * @param out_shipcode Receives its shipcode.
++     * @param out_xmlfile Receives the path to its XML definition.
++     * @return true if this entitlement is an update of a previously-installed product.
++     */
+     bool AreWeAnUpdate(btkString& out_name, btkString& out_ver, btkString& out_shipcode, btkString& out_xmlfile);
++    /**
++     * @param out Receives the generated Add/Remove Programs uninstall display name.
++     * @return true on success.
++     */
+     bool GenerateUninstallName(btkString&);
++    /**
++     * Rewrites download URLs in the given document against a new root path,
++     * matching each URL's trailing filename to the corresponding CDSECTION entry.
++     *
++     * @param download_url_references The download-URL XML document to rewrite.
++     * @param UrlRoot The new URL root to rewrite against.
++     * @return true on success.
++     */
+     bool UpdateUrls(pimXmlFile* download_url_references, btkString& UrlRoot);
++    /**
++     * @param entry File to check.
++     * @param service_name Receives the Windows service name if the EXE is a service.
++     * @return true if the given EXE payload is actually a Windows service.
++     */
+     bool IsExeService(btkFSEntry&, btkString& service_name);
++    /**
++     * Performs post-uninstall directory cleanup for this entitlement.
++     *
++     * @param curDir Current working directory context for the cleanup.
++     * @param group_flag Whether this is part of a group uninstall.
++     * @return true on success.
++     */
+     bool pimCleanupUninstall(btkWString curDir, bool group_flag);
++    /**
++     * Starts the pimCopier/pimCopyLoop sub-step for this entitlement's file/archive payload.
++     * @return true if the copy started successfully.
++     */
+     bool StartCopy();
++    /**
++     * Blocks until the copy sub-step started by StartCopy() completes.
++     * @return true if the copy completed without error.
++     */
+     bool WaitForCopyToComplete();
++    /**
++     * Drives the MSI install sub-step for this entitlement.
++     * @return true if the MSI install completed without error.
++     */
+     bool InstallMSI();
++    /**
++     * Drives the registry-edit sub-step for this entitlement.
++     * @return true if all registry changes were applied without error.
++     */
+     bool ApplyRegistryChanges();
++    /**
++     * Drives a transient pimScriptLoop to run this entitlement's install scripts.
++     * @return true if the scripts ran without error.
++     */
+     bool InstallScripts();
++	/**
++	 * Drives the pimServices/pimServiceLoop sub-step to install/start/stop
++	 * this entitlement's Windows service.
++	 *
++	 * @param sa The service action to perform (default: InstallAction).
++	 * @return true on success.
++	 */
+ 	bool PerformServiceAction(pimServices::ServiceAction sa = pimServices::InstallAction);
++	/**
++	 * Uninstalls this entitlement's Windows service.
++	 * @return true on success.
++	 */
+ 	bool UninstallService();
++    /**
++     * Drives a transient pimPsfLoop to create this entitlement's PSF entry.
++     * @return true on success.
++     */
+     bool InstallPSF();
++    /**
++     * Drives the pimShortcuts/pimShortcutLoop sub-step to create shortcuts.
++     * @return true on success.
++     */
+     bool InstallShortcuts();
++    /**
++     * Removes shortcuts previously created by InstallShortcuts().
++     * @return void
++     */
+     void UninstallShortcuts();
+ public:
+     pimEntitlement();
+     ~pimEntitlement();
+ 
++    /**
++     * Identifies which UI "customize" layout or shortcut/quality-agent
++     * category a given customization request applies to.
++     */
+     enum CustomizeAttribs
+     {
+         // customize layouts
+@@ -197,127 +444,492 @@
+         //
+     };
+ 
++    /**
++     * Initializes this entitlement by parsing the given product-definition XML file.
++     *
++     * @param entitlementXmlFile Path to the product XML file.
++     * @param root_match Optional expected root element name; Init fails if it doesn't match.
++     * @param cd_creator When true, initializes in CD/media-creation mode rather than install mode.
++     * @return true on success.
++     */
+     bool Init(const char* entitlementXmlFile, const char* root_match = NULL, bool cd_creator = false);
++    /**
++     * Initializes this entitlement from already-parsed XML documents.
++     *
++     * @param application_definition The product-definition XML document.
++     * @param download_url_references The associated download-URL XML document.
++     * @param MediaID Media identifier this entitlement is associated with.
++     * @return true on success.
++     */
+     bool Init(pimXmlFile* application_definition,
+         pimXmlFile* download_url_references,
+         const btkString& MediaID);
++    /**
++     * Regenerates download URLs when the current ones have timed out.
++     * @return true on success.
++     */
+     bool UpdateMediaUrls();
+ 
++    /**
++     * Caches installer payload files (e.g. the "pim" directory) locally for immediate use.
++     * @return void
++     */
+     void CacheInstaller();
++    /**
++     * Removes the local installer cache created by CacheInstaller(), unless PIM_KEEP_CACHE is set.
++     * @return void
++     */
+     void RemoveCache();
++	/**
++	 * Refreshes cached pointers/state derived from this entitlement's XML document.
++	 * @return void
++	 */
+ 	void RefreshXmlNodes();
+     // who are we
++    /**
++     * @return This entitlement's unique ID.
++     */
+     const char* GetID() { return ID; }
++    /**
++     * @return This entitlement's tag (product-definition file identifier).
++     */
+     const char* GetTag() { return Tag; }
++    /**
++     * @return This entitlement's preference value.
++     */
+     const char* GetPref() { return Pref; }
++    /**
++     * @return This entitlement's Add/Remove Programs display name (ARP).
++     */
+     const char* GetARP() { return ARP; }
++    /**
++     * @return This entitlement's primary license prefix (e.g. "CREOPMA").
++     */
+     const char* GetPrefix() { return PrimaryLicensePrefix; }
++    /**
++     * @return This entitlement's product family name (e.g. "Creo", "PTC Mathcad").
++     */
+     const char* GetFamily() { return Family; }
++    /**
++     * @return The ID of the parent entitlement this one requires, if any.
++     */
+     const char* GetRequiredParentEntitlement() { return ParentEntitlement; }
++    /**
++     * @return The original XML file path this entitlement was initialized from.
++     */
+     const char* OriginalXMLFilePath() { return OriginalFile; }
+     // general
++    /**
++     * @param tf Whether this entitlement should be installed.
++     * @return true on success.
++     */
+     bool SetInstallMe(bool tf); // returns success/fail
++    /**
++     * @return true if this entitlement is currently marked to be installed.
++     */
+     bool GetInstallMe();
++    /**
++     * @param force_recalculate When true, recomputes the update-detection result instead of using a cached value.
++     * @return true if this entitlement represents an update of a previously-installed product.
++     */
+     bool AreWeAnUpdate(bool force_recalculate = false);
++    /**
++     * @param tf Whether this entitlement should be reconfigured.
++     * @return true on success.
++     */
+     bool SetReconfigureMe(bool tf);
++    /**
++     * @return true if this entitlement is marked for reconfigure.
++     */
+     bool GetReconfigureMe();
+ 
+     // MSI
++    /**
++     * @return true if this entitlement installs via MSI.
++     */
+     bool IsMSIInstall();
++    /**
++     * @return true if this entitlement is a hybrid MSI (combined with another install mechanism).
++     */
+     bool IsMSIHybrid();
++    /**
++     * @return true if this entitlement has any MSI install component.
++     */
+     bool HasMSIInstall();
++    /**
++     * @return true if the same MSI version is already installed.
++     */
+     bool IsMSISameVersionInstalled();
++    /**
++     * @return true if the same SFX version is already installed.
++     */
+     bool IsSFXSameVersionInstalled();
++    /**
++     * @param ignore_same_version When true, treats a same-version MSI as still being an update.
++     * @return true if this entitlement's MSI represents an update of an installed version.
++     */
+     bool IsMSIAnUpdate(bool ignore_same_version = false);
++    /**
++     * @return true if this entitlement's MSI is a fresh install (not an update).
++     */
+     bool IsMSINewInstall();
++    /**
++     * @param is_same_msi Receives whether the same MSI major version is already installed.
++     * @return true on success.
++     */
+     bool pimIsSameMSIMajorVersionInstalled(bool& is_same_msi);
++    /**
++     * @return true if this entitlement includes an engineering-notebook install component.
++     */
+     bool HasEngNotebookInstall();
+ 
++    /**
++     * @return true if this entitlement installs via a self-extracting (SFX) executable.
++     */
+     bool IsSFXInstall();
+ 
++    /**
++     * @return true if this entitlement is marked required (cannot be deselected).
++     */
+     bool IsRequired();
++    /**
++     * @return true if this entitlement is itself registered as a prerequisite of another.
++     */
+     bool IsPrerequisite();
++    /**
++     * @return true if this entitlement is parent-only (a grouping node, not independently installable).
++     */
+     bool IsParentOnly();
++    /**
++     * @return true if this entitlement is a Windchill Workgroup Manager adaptor install.
++     */
+     bool IsWGMAdaptorInstall();
+ 
++    /**
++     * @return true if this entitlement has any registered prerequisites.
++     */
+     bool HasPrerequisite();
++    /**
++     * @param enable_logs When true, logs the evaluation result.
++     * @return true if, as a prerequisite, this entitlement is itself already satisfied.
++     */
+     bool IsPrerequisiteSatisfied(bool enable_logs = false); // if IsPrerequisite() == true; is this PreRequisite itself satisfied or should it be installed.
++    /**
++     * @return true if this entitlement has any registered prerequisites that are not currently satisfied.
++     */
+     bool PrerequisiteNeeded(); // does this entitlement have any PreRequisites registered that are not currently satisfied.
++    /**
++     * @return true if all unsatisfied prerequisites for this entitlement are soft (non-blocking).
++     */
+     bool IsOnlySoftPrerequisiteNeeded();
++    /**
++     * Registers another entitlement as a prerequisite of this one.
++     *
++     * @param prereq The prerequisite entitlement (not owned by this class).
++     * @param soft When true, registers it as a soft (advisory, non-blocking) prerequisite.
++     * @return true on success.
++     */
+     bool AddPrerequisite(pimEntitlement*, bool soft = false); // register an entitlement class as a prerequisite of this one
++    /**
++     * @param id GetID() string of the prerequisite to remove.
++     * @return true if found and removed.
++     */
+     bool DropPrerequisite(const char*); // drop by pimEntitlement->GetID() string
++    /**
++     * Recomputes the satisfied/unsatisfied state of all registered prerequisites.
++     * @return void
++     */
+     void RefreshPrerequisites();
++    /**
++     * Stateful iterator over this entitlement's registered prerequisites.
++     *
++     * @param out Receives the next prerequisite entitlement pointer.
++     * @param start_index Iteration cursor; updated in place.
++     * @param satisified_or_not When true, includes already-satisfied prerequisites; when false, only unsatisfied ones.
++     * @return true if a prerequisite was returned; false when iteration is exhausted.
++     */
+     bool GetNextPrerequisite(pimEntitlement**, int& start_index, bool satisified_or_not = false);
++    /**
++     * @param prereq Prerequisite entitlement to check.
++     * @return true if the given entitlement is registered as a soft prerequisite of this one.
++     */
+     bool IsSoftPrerequisite(pimEntitlement*);
++    /**
++     * @return true if every prerequisite's install succeeded.
++     */
+     bool HasPrerequisitesInstallSucceeded();
+ 
+     // Get Info
++    /**
++     * @param out Receives this entitlement's display label.
++     * @return true on success.
++     */
+     bool GetLabel(btkString&);
++    /**
++     * @param out Receives the required install size.
++     * @param include_install_equal_no When true, includes size for components not currently selected to install.
++     * @return true on success.
++     */
+     bool GetSize(double&, bool include_install_equal_no = false);  // required
++    /**
++     * @param out Receives an install-size estimate in KB, ignoring features with a location attribute.
++     * @return true on success.
++     */
+     bool GetLocalSizeEstimate(double&); // in KB install features size ignoring those with location attrib
++    /**
++     * @param out Receives a human-readable formatted size string.
++     * @return true on success.
++     */
+     bool GetSizeString(btkString&);
++    /**
++     * @param out Receives the download size.
++     * @return true on success.
++     */
+     bool GetDownloadSize(double&);
++    /**
++     * @param out Receives a human-readable formatted download-size string.
++     * @return true on success.
++     */
+     bool GetDownloadSizeString(btkString&);
++    /**
++     * @param out Receives this entitlement's version string.
++     * @return true on success.
++     */
+     bool GetVersion(btkString&);
++    /**
++     * @param out Receives a combined version+shipcode string.
++     * @return true on success.
++     */
+     bool GetVersionShipcode(btkString&);
++    /**
++     * @param out Receives this entitlement's shipcode.
++     * @return true on success.
++     */
+     bool GetShipcode(btkString&);
++    /**
++     * @param status Receives the current install status text.
++     * @param detail Receives additional detail text.
++     * @return true on success.
++     */
+     bool GetInstallStatus(btkString&, btkString&);
++    /**
++     * @param pct Receives the download completion percentage.
++     * @return true only if a download will occur (and pct == 100 once it's done).
++     */
+     bool GetDownloadStatus(int& pct); // returns true only if it will do download and pct == 100 when it is done
+ 
+     // do customize
++    /**
++     * @param attrib The customize category to check.
++     * @return true if this entitlement supports customization of the given category.
++     */
+     bool SupportCustomize(CustomizeAttribs);
++    /**
++     * Backs up this entitlement's XML before a customize dialog is shown, so
++     * a canceled customize can be reverted via RestoreFromBackup().
++     * @return true on success.
++     */
+     bool BackupFile(); // before we customize we need to backup incase they cancel out of the customize dialog
++    /**
++     * Restores this entitlement's XML from the backup made by BackupFile(),
++     * used when the user cancels a customize dialog.
++     * @return true on success.
++     */
+     bool RestoreFromBackup(); // if they cancel out of the customize dialog; we call this to restore from backup point
++    /**
++     * @return true if Quality Agent is required for this entitlement.
++     */
+     bool IsQualityAgentRequired();
++    /**
++     * @param tf Whether Quality Agent should be enabled for this entitlement.
++     * @return true on success.
++     */
+     bool SetQualityAgent(bool);
++    /**
++     * @param tf Whether Quality Agent should be marked required for this entitlement.
++     * @return true on success.
++     */
+     bool SetQualityAgentRequired(bool);
++    /**
++     * @param out Receives whether Quality Agent is currently enabled.
++     * @return true on success.
++     */
+     bool IsQualityAgentEnabled(bool&);
++    /**
++     * @return true if this application is designed to work with Quality Agent.
++     */
+     bool CanEnableQualityAgent(); // if this application is designed to work with QualityAgent.
+ 
+     // about loadpoint
++    /**
++     * @param path Base parent directory selected in the UI.
++     * @return true on success.
++     */
+     bool SetInstallPoint(const char*); // base parent directory selected in UI
++    /**
++     * @param out Receives the current install point.
++     * @return true on success.
++     */
+     bool GetInstallPoint(btkString&);
++    /**
++     * @param out Receives the reason install cannot proceed, if any.
++     * @param help Receives associated help text.
++     * @return true if it is OK to install.
++     */
+     bool CheckOKToInstall(btkString& out, btkString& help);
++    /**
++     * @param out Receives the reason uninstall cannot proceed, if any.
++     * @param shutdown_files_in_use When true, attempts to shut down processes that have files open.
++     * @return true if it is OK to uninstall.
++     */
+     bool CheckOKToUninstall(btkString& out, bool shutdown_files_in_use);
++    /**
++     * @param out Receives the names of running WGM executables blocking the operation.
++     * @return true if any relevant WGM executables are currently running.
++     */
+     bool IsWGMExesRunning(btkString&);
++    /**
++     * @return true if this entitlement's update-relevant state has changed since it was last evaluated.
++     */
+     bool IsUpdateChanged();
+ 
+     // about licenses
++    /**
++     * @param out Receives the list of license prefixes for PSF entries.
++     * @return true on success.
++     */
+     bool GetLicensePrefixes(StringXArray&);    // Prefix list for PSF entries
++    /**
++     * @param out Receives the list of license sources for PSF entries.
++     * @return true on success.
++     */
+     bool GetLicenseSources(StringXArray&);     // Sources list for PSF entries
++    /**
++     * @param source License source to add to the PSF entries.
++     * @return true on success.
++     */
+     bool AppendLicenseSource(const char*);     // Add to PSF entries
++    /**
++     * @param source License source that replaces the existing PSF sources (features are kept).
++     * @return true on success.
++     */
+     bool ReplaceLicenseSource(const char*);    // Set to PSF entries (clears existing sources not features)
++    /**
++     * @param source License source to clear from the PSF entries (features are kept).
++     * @return true on success.
++     */
+     bool ClearLicenseSource(const char*);      // Clear only license source not features
++    /**
++     * Clears only the license features from the PSF entries, keeping sources.
++     * @return true on success.
++     */
+     bool ClearLicenseFeatures();                // Clear only the license features not the sources
++    /**
++     * @param features License features to add to the PSF entries.
++     * @return true on success.
++     */
+     bool AppendLicenseFeatures(StringXArray&); // Add to PSF entries
++    /**
++     * Clears both license sources and features from the PSF entries.
++     * @return true on success.
++     */
+     bool ClearLicenseSourcesNFeatures();        // Clear the above
++    /**
++     * @return true if license sources/features have already been initialized for this entitlement.
++     */
+     bool LicenseSourcesHasBeenInit();           // already defined/called above
++    /**
++     * @param availableContent The content set available to initialize the "required set" options from.
++     * @return true on success.
++     */
+     bool InitRequiredSet(const StringXArray&); // available content to Init Required Set options from.
+ 
+     // start thread to Install/uninstall
++    /**
++     * Starts (or restarts, if already running) this entitlement's
++     * install/uninstall thread via the inherited pimLoop::Execute().
++     * @return void
++     */
+     void StartOrRestartInstall();
++    /**
++     * Starts this entitlement's reconfigure thread.
++     * @return void
++     */
+     void Reconfigure();
++    /**
++     * @return true if this entitlement is currently rolling back a failed/canceled install.
++     */
+     bool IsInRollback();
++    /**
++     * Starts this entitlement's uninstall thread.
++     * @return void
++     */
+     void Uninstall();
+ 
+     // during processing Install
++    /**
++     * Requests cancellation of the current install/uninstall operation.
++     * @return void
++     */
+     void Cancel();
++    /**
++     * @return true if Cancel() has been requested.
++     */
+     bool IsCancelFlagSet();
++    /**
++     * @return true if the current operation has finished.
++     */
+     bool IsDone();
++    /**
++     * @return true if errors have been recorded for the current operation.
++     */
+     bool HasErrors();
++    /**
++     * @return true if warnings have been recorded for the current operation.
++     */
+     bool HasWarnings();
++    /**
++     * Force-terminates this entitlement's worker thread.
++     * @return void
++     */
+     void Kill();
+ 
++    /**
++     * @return true if the in-progress MSI operation can currently be canceled.
++     */
+     bool CanCancelMSI();
+ 
+     // How is Install going...
++    /**
++     * @param out Receives the accumulated error text.
++     * @return void
++     */
+     void GetErrors(btkString& out);
++    /**
++     * @param out Receives the accumulated warning text.
++     * @param remove_hyperlinks When true, strips embedded hyperlink markup.
++     * @return void
++     */
+     void GetWarnings(btkString& out, bool remove_hyperlinks = false);
++    /**
++     * @param out Receives a human-readable label for the current install step.
++     * @return true on success.
++     */
+     bool GetInstallStep(btkString&);
++    /**
++     * @param percent Receives the current overall progress percentage.
++     * @return true on success.
++     */
+     bool GetProgress(int& percent);
+ 
+     // access data xml file
++    /**
++     * @return This entitlement's own product-definition XML document.
++     */
+     pimXmlFile* GetXMLPtr() { return xmlPtr; }
++    /**
++     * @return The XML document of the product this entitlement is updating from, or NULL if not an update.
++     */
+     pimXmlFile* GetUpdateXMLPtr() { if (UpdateOfProduct) return UpdateOfProduct->GetXMLPtr(); return NULL; }
+ 
+     friend class upimDlg;
+@@ -326,6 +938,16 @@
+ 
+ // utility function
+ // PreRead or PreWrite should already be called before calling this...
++/**
++ * Configures the given pimConvert to resolve property placeholders (such as
++ * [INSTALLBASE]) against the given XML document's session/entitlement
++ * context, optionally scoped to a specific pattern.
++ *
++ * @param converter The converter to configure.
++ * @param xml The XML document providing property values.
++ * @param pattern Optional pattern restricting which placeholders are resolved.
++ * @return void
++ */
+ void SetupConverter(pimConvert&, pimXmlFile*, const char* pattern = NULL);
+ 
+ #define ENTITLEMENT_STATUS_STRING "status_message"

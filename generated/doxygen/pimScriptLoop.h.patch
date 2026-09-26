@@ -1,0 +1,120 @@
+--- a/pim_core/includes/pimScriptLoop.h
++++ b/pim_core/includes/pimScriptLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -14,19 +14,97 @@
+ 
+ class pimConvert;
+ 
++/**
++ * Install-step (pimLoop subclass) that generates and removes script files on
++ * disk from a template-and-include composition mechanism, substituting
++ * property placeholders into the output.
++ *
++ * Responsibilities:
++ * - Iterate <SCRIPT> elements and, for each, locate a named script definition
++ *   in a separate template XML document (CreateScript()).
++ * - Compose a script's content from that template's <INCLUDE>/<BODY>
++ *   elements, resolve placeholders via pimConvert, and write it to disk.
++ * - Inject licensing-related properties ([LM_LICENSE_FILE], [DCAD_TEMP],
++ *   [PARAMETRIC], [SIMULATE]) used by script templates.
++ * - Filter <SCRIPT> nodes by parent <PACKAGE> install state and by platform.
++ * - On rollback, remove scripts marked installed="Y", except one named
++ *   "silentGroupUninstall" which this class never removes.
++ *
++ * Dependencies:
++ * - pimLoop (base class).
++ * - pimConvert (property resolution).
++ * - pimPlatformMgr (platform-name filtering).
++ * - pimCommandMgr / pimSessionInfo (license-ID / license-source lookups for
++ *   the injected properties).
++ * - LocateXMLFile (resolves the template XML document).
++ *
++ * Ownership: unlike the other 7 Loop-owner pairs in this codebase, there is
++ * NO singleton wrapper for this class -- pimEntitlement creates and destroys
++ * it directly, per call. Script generation for different entitlements can
++ * therefore run fully concurrently.
++ */
+ class pimScriptLoop : public pimLoop
+ {
+ private:
+ 	int do_rollback;
+ protected:
++	/**
++	 * Thread entry point; dispatches to OnInstall() or OnRollback() based on
++	 * do_rollback.
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * For each eligible <SCRIPT> node: resolves/loads the referenced template
++	 * document (cached across iterations while the source attribute is
++	 * unchanged), calls CreateScript(), and on success marks installed="Y".
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * For each <SCRIPT installed="Y"> node (excluding one literally named
++	 * "silentGroupUninstall", which is never removed by this class): calls
++	 * RemoveScript() and clears the installed attribute on success.
++	 * @return void
++	 */
+ 	void OnRollback();
++
++	/**
++	 * Standard thread teardown.
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
++	/**
++	 * Finds the <SCRIPT name="name"> node inside templateXML, concatenates
++	 * its <INCLUDE>/<BODY> content, resolves placeholders in both the
++	 * content and dest via Converter, creates the destination directory if
++	 * needed, and writes the file.
++	 *
++	 * @param name The script definition's name, matched against the template.
++	 * @param dest Output file path (may contain unresolved property placeholders).
++	 * @param templateXML The loaded template document containing the named script.
++	 * @param Converter Resolves property placeholders in content and dest.
++	 * @return true if the script was found and written successfully.
++	 */
+ 	bool CreateScript(const char *name, const char *dest, pimXmlFile *templateXML, pimConvert *);
++
++	/**
++	 * Resolves dest's placeholders and erases the file if it exists.
++	 *
++	 * @param dest Output file path to remove.
++	 * @param Converter Resolves property placeholders in dest, or NULL to use dest as-is.
++	 * @return true (always, whether or not a file was actually present to erase).
++	 */
+ 	bool RemoveScript(const char *dest, pimConvert *);
+ public:
++	/**
++	 * Constructs a pimScriptLoop bound to the given XML content, with
++	 * do_rollback initialized to false.
++	 * @param ScriptXMLContent The product/entitlement XML describing what to install.
++	 */
+ 	pimScriptLoop(pimXmlFile *ScriptXMLContent) : pimLoop(ScriptXMLContent)
+ 	{
+ 		do_rollback = false;
+@@ -35,6 +113,12 @@
+ 	/*
+ 	 * scripts that have attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Marks this Loop to run OnRollback() (remove installed="Y" scripts)
++	 * instead of OnInstall() when Execute()d.
++	 * @param tf New rollback-mode flag value.
++	 * @return void
++	 */
+ 	void SetRollback(bool tf) { do_rollback = tf; }
+ };
+ 

@@ -1,0 +1,88 @@
+--- a/pim_ui/includes/pimFrictionlessTrialDlg.h
++++ b/pim_ui/includes/pimFrictionlessTrialDlg.h
+@@ -25,6 +25,32 @@
+ #define RESET_PWD_LINK "https://www.ptc.com/appserver/common/account/password.jsp"
+ 
+ 
++/**
++ * @brief The UI for pim_rl.exe's "Frictionless Trial"/"Commercial Trial"
++ *        license-retrieval flow: shows host ID/SCN/application name, an
++ *        editable account email, and drives a background FLEXnet
++ *        license-retrieval worker (pimFrictionlessTrialLicenseGet) to fetch
++ *        and install (or, in cleanup mode, remove) a trial license.
++ *
++ * CONFIRMED HIGH-SEVERITY BUG: for the only confirmed real usage of this
++ * class (pimTop.cxx's pimFrictionlessTrialRun(), which always sets
++ * pimGetInHouseMode() to 1 or 2 before calling Display()), Display() takes a
++ * branch that calls FrictionlessLicenseGenerate() then blocks on a raw
++ * Sleep(60000) and returns -- it never calls uiDialog::Activate(), so the
++ * armed LicenseGenerateTimer never fires, so OnTimerExpired() (the ONLY call
++ * site anywhere in this codebase for
++ * pimFrictionlessTrialLicenseGet::HeartBeat(), confirmed by archive-wide
++ * grep) never runs. HeartBeat() is where the retrieved license is actually
++ * saved to disk and the local PSF is updated -- none of that completion
++ * logic ever executes in this path, and the freshly-XNew'd worker object is
++ * never deleted either (only OnTimerExpired() frees it). See
++ * docs/classes/pimFrictionlessTrialDlg.md Risk Analysis for full detail.
++ *
++ * CONFIRMED DEAD CODE: SetURL()/the URL member, GetAuth(), and the private
++ * Refresh() method all have zero confirmed callers anywhere in this archive;
++ * the file-scope `frictionlessDlg` static self-pointer (set in the
++ * constructor) likewise has no accessor and is never read.
++ */
+ class pimFrictionlessTrialDlg : public uiDialog
+ {
+ private:
+@@ -33,7 +59,7 @@
+ 	uiLabel DescLabel;
+ 	uiLabel CleanupLabel;
+ 	uiLabel UserNameLabel;
+-	uiLabel UserNameInput;	
++	uiLabel UserNameInput;
+ 	uiPushButton RenewLicenseButton;
+ 	uiPushButton ContinueButton;
+ 	uiPushButton CleanupButton;
+@@ -46,26 +72,40 @@
+ 	uiLabel ApplicationNameValueLabel;
+ 	uiLabel ProcessingLabel;
+ 	uiLabel NoteInfoLabel;
+-	uiTimer LicenseGenerateTimer;
++	uiTimer LicenseGenerateTimer;  ///< Armed by FrictionlessLicenseGenerate(); confirmed to never fire in the only real usage (see class comment).
+ public:
+ 	pimFrictionlessTrialDlg();
+ 	~pimFrictionlessTrialDlg();
++	/// Idempotent; populates read-only fields from SessionInfo and switches to
++	/// cleanup-mode widget visibility if CLEANUP_ACTION == "Y".
+ 	bool Initialize();
+ 	void SetSessionInfoFile(pimSessionInfo *S) { SessionInfo = S; }
++	/// CONFIRMED BUG: for pimGetInHouseMode() == 1 or 2, blocks on Sleep(60000)
++	/// instead of calling uiDialog::Activate() -- see class-level comment.
+ 	bool Display();
++	/// Starts the background license-retrieval worker and arms LicenseGenerateTimer.
+ 	void FrictionlessLicenseGenerate();
++	/// CONFIRMED DEAD: zero callers anywhere in this archive; the URL member
++	/// it sets is never read by this class either.
+ 	void SetURL(const wchar_t *);
+ 	void CleanupLicenseFile();
++	/// CONFIRMED DEAD: zero callers anywhere in this archive (contrast with
++	/// the sibling GetAuth() on pimAuthDlg/rpimDlg, which ARE called).
+ 	bool GetAuth(btkWString &username, btkWString &password);
+ private:
+ 	bool initialized;
+ 	bool cleanup_flag;
+ 	pimSessionInfo *SessionInfo;
++	/// CONFIRMED DEAD: declared and defined but never called anywhere (private, so no external caller is possible).
+ 	void Refresh();
+-	btkWString URL, User, Password, RetryMsg;
+-	
++	btkWString URL, User, Password, RetryMsg;  ///< URL is confirmed write-only.
++
+ protected:
+ 	bool OnPushButtonActivate(uiPushButton &);
++	/// The intended poll callback for LicenseGenerateTimer; the ONLY call site
++	/// for pimFrictionlessTrialLicenseGet::HeartBeat() in this codebase.
++	/// Contains a confirmed-dead reentrancy guard (a static in_timer that is
++	/// checked but never set true) -- see class-level comment.
+ 	uiTimerOp OnTimerExpired (uiTimer&, void *user_data);
+ 	bool OnClose();
+ };

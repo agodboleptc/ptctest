@@ -1,0 +1,542 @@
+--- a/pim_ui/includes/pimInstallMgrDlg.h
++++ b/pim_ui/includes/pimInstallMgrDlg.h
+@@ -105,11 +105,19 @@
+ 
+ # define uiWString(WS) ((wchar_t*)(const wchar_t*) WS)
+ 
++/**
++ * Idle callback target that calls MainUIDialog->Refresh() if the global
++ * dialog pointer is set, letting background code (e.g. a completing
++ * pimGetAvailable search) request a UI refresh from outside pimInstallMgrDlg's
++ * own event handlers.
++ * @return UI_SUCCESS.
++ */
+ int DoMainDialogRefresh(void *unused, void *dummy);
+ 
+ class uiLicenseSummaryTable;
+ class pimPTCLicenseGet;
+ 
++/** Input panel used inside uiLicenseSummaryTable's per-row license-source entry; supports drag-and-drop of a license file. */
+ class uiLSTInputPanel : public uiInputPanel
+ {
+ private:
+@@ -125,6 +133,7 @@
+ friend class uiLicenseSummaryTable;
+ };
+ 
++/** The dynamic license-source entry table on the License Source step; manages add/remove rows of license file/server sources and their validation status. */
+ class uiLicenseSummaryTable : public uiTable
+ {
+ private:
+@@ -181,6 +190,7 @@
+ 	friend class uiLSTInputPanel;
+ };
+ 
++/** One row of the Installation-progress table: a per-entitlement progress bar plus Restart/Cancel/Info controls. */
+ class EntitlementItem
+ {
+ public:
+@@ -231,6 +241,7 @@
+ 	
+ };
+ 
++/** The Installation/Install-Update step's per-entitlement progress table, hosting one EntitlementItem row per installing product. */
+ class uiInstallationTable : public uiTable
+ {
+ private:
+@@ -255,6 +266,7 @@
+ 	bool OnPushButtonActivate (cStringT Row, cStringT Col, uiPushButton&);
+ };
+ 
++/** Simple (status, description, help-text) tuple used to report a single application's install eligibility/status. */
+ class uiAppStatus
+ {
+ 	bool status;
+@@ -274,6 +286,19 @@
+ 	const char *Help() { return help; }
+ };
+ 
++/**
++ * A checkbox cell with an aligned label, dynamically add/removable from a
++ * uiContainer at a given row/column. Fully implemented in
++ * pim_ui_src/pimEntitlementRefresh.cxx:129-273.
++ *
++ * CONFIRMED DEAD CODE (full-archive grep, documented in
++ * docs/classes/pimInstallMgrDlg.md Risk Analysis): this class has no live
++ * caller. Its only would-be consumer, pimInstallMgrDlg::CreateQAgentButton()
++ * / CreatedQAgentBtns, is declared exclusively inside the nested
++ * uiApplicationsList class below, which is itself wrapped in a class-wide
++ * `#if 0` block. No `XNew uiCheckButtonCell(...)` construction exists
++ * anywhere else in the archive.
++ */
+ class uiCheckButtonCell : public uiCheckButton
+ {
+ protected:
+@@ -288,10 +313,15 @@
+ 	// call to create/delete
+ 	// these should be called before AddComponent
+ 	// and no other calls should occur after DelDynamicComponent
++
++	/** Builds a Layout+CheckButton+Label triple via raw ui_do_operation() calls, rolling back on partial failure. Unreachable -- see class comment. */
+ 	static uiCheckButtonCell* AddDynamicComponent(cStringT _name, uiContainer * _parent, int row_idx, int col_idx);
++	/** Mirror teardown of AddDynamicComponent(). Unreachable -- see class comment. */
+ 	bool DelDynamicComponent(cStringT _name, uiContainer * _parent);
+ 
++	/** CONFIRMED hard-disabled: body is `#if 0 // Eyal does not want labels` ... unconditional `return false;` (pimEntitlementRefresh.cxx:250-257). */
+ 	bool SetAlignedLabel(ptc_intptr msg_id);
++	/** CONFIRMED hard-disabled: same `#if 0 // Eyal does not want labels` pattern as the overload above (pimEntitlementRefresh.cxx:259-266). */
+ 	bool SetAlignedLabel(cStringT);
+ };
+ 
+@@ -329,6 +359,13 @@
+ };
+ #endif
+ 
++/**
++ * The "Application Features" tree on the embedded Customize Apps tab.
++ * CONFIRMED: this class's UpdateParentEntitlements()/UpdateChildEntitlements()
++ * are near-verbatim duplicates of pimInstallMgrDlg's own methods of the same
++ * name (see docs/classes/pimInstallMgrDlg.md Risk Analysis) -- a fix to one
++ * copy should be checked against the other.
++ */
+ class uiCustomAppTree : public uiTree
+ {
+ private:
+@@ -359,6 +396,7 @@
+ 	bool Init(); // call when we reset the Current Mgr classes; ie we need to init the whole tree
+ };
+ 
++/** The customizable-products list on the Customize Apps tab (mCustomizableProducts). */
+ class uiCustomApplicationList : public uiList
+ {
+ private:
+@@ -376,6 +414,7 @@
+ 
+ };
+ 
++/** The "Simulate Licenses" customize-tab table (mSimulateLicenseTable), populated from the current product's SimulateLicenseTypes XML property. */
+ class pimCustomSimulateLicenseTable : public uiTable
+ {
+ private:
+@@ -392,6 +431,7 @@
+ 	bool initialized;
+ };
+ 
++/** The "Misc" customize-tab table (mMiscTable), populated from the product XML's <USER_INPUT> elements. */
+ class pimCustomMiscTable : public uiTable
+ {
+ private:
+@@ -418,6 +458,7 @@
+ 	bool initialized;
+ 
+ };
++/** The "Command Configuration" customize-tab table (mCommandTable), backed by pimCommandMgr. */
+ class pimCustomCommandTable : public uiTable
+ {
+ private:
+@@ -436,6 +477,35 @@
+ 	friend class pimInstallMgrDlg;
+ };
+ 
++/**
++ * The single main-window wizard dialog driving the entire interactive
++ * install experience: Welcome -> EULA (or Beta EULA) -> License Source ->
++ * Applications -> Application Update/Selection -> Customize Apps ->
++ * Installation (or Install Update) -> Summary.
++ *
++ * Constructed as a stack-local object at one of 3 independent top-level
++ * entry points in pim/pim_src/pimTop.cxx; not a GetInstance()-style
++ * singleton -- global reachability via GetMainUIDialog() is a raw
++ * file-static pointer set once in the constructor and never cleared.
++ *
++ * The wizard step order is a hardcoded, hand-written linear state machine
++ * over the CurrentLayout pointer (StepBack()/StepForward(), in
++ * pim_ui_src/pimInstallMgrActions.cxx) -- CONFIRMED to have a guard-condition
++ * asymmetry around the Customize Apps step (StepForward() checks
++ * currentProduct before allowing that step; StepBack() does not). See
++ * docs/classes/pimInstallMgrDlg.md Risk Analysis for this and further
++ * confirmed findings: UpdateParentEntitlements()/UpdateChildEntitlements()
++ * are duplicated near-verbatim in the nested uiCustomAppTree class in this
++ * same file; RefreshFeatureTab() is a permanent no-op despite being
++ * dispatched on every relevant tab selection; the Help/Advanced customize
++ * tab is deliberately disabled via two commented-out call sites;
++ * SetPortError()'s PORT_OUT_OF_RANGE_ERROR and PORT_INVALID_FORMAT_ERROR
++ * cases share one message id; OnClose()/OnFinishFromEula()/
++ * OnFinishFromBetaEula() are three independently-written, near-identical
++ * exit paths; and a separate, likely-superseded class pimCustomDlg
++ * implements a near-identical method-name set for what appears to be an
++ * older, standalone version of the Customize dialog.
++ */
+ class pimInstallMgrDlg : public uiDialog
+ {
+ private:
+@@ -688,7 +758,7 @@
+ 
+ 	typedef enum  {
+ 		PORT_BUSY_WARNING = 0,
+-		PORT_RESERVED_RANGE_WARNING   // 1–1023
++		PORT_RESERVED_RANGE_WARNING   // 1ï¿½1023
+ 	} PORT_WARNING;
+ 
+ 	typedef enum  {
+@@ -699,10 +769,29 @@
+ 	}PORT_ERROR;
+ 
+ 
++	/**
++	 * Assembles the entire UI component tree (~350 lines of AddComponent()
++	 * calls across every wizard screen) and sets the global MainUIDialog
++	 * pointer to this instance.
++	 */
+ 	pimInstallMgrDlg();
++
++	/** Calls LocateAllowPTCDotCom(false, NULL) and deletes AvailableDownloads if set; does NOT clear the global MainUIDialog pointer. */
+ 	~pimInstallMgrDlg();
+ 
++	/**
++	 * One-time setup (guarded by the initialized flag): sets every wizard
++	 * step's initial nav-image/style, product-mode-specific label text,
++	 * dark-mode style registration, and app-features search-widget init.
++	 * @return true once initialized (or already was).
++	 */
+ 	bool Initialize();
++
++	/**
++	 * Activates (shows/runs) the dialog via the base uiDialog::Activate(),
++	 * presumed blocking/modal.
++	 * @return The base class's activation result.
++	 */
+ 	bool Display();
+ 	void Refresh();
+ 	bool SetSABPath(const char *in);
+@@ -713,23 +802,52 @@
+ 	void SetSessionInfoFile(pimSessionInfo *S) { SessionInfo = S; }
+ 
+ 	// public to allow via callback from ApplicationsTree...
++	/** Recomputes the tri-state "enable Quality Agent for all" checkbox across all selected entitlements. Defined in pimEntitlementRefresh.cxx:1324-1422. */
+ 	void EntitlementRefresh_updateQagent();
++	/**
++	 * Enables CustomizeBtn if some selected entitlement supports customization.
++	 * CONFIRMED: additionally gated on `getenv("PIM_HIDE_CUSTOMIZE_SCREEN")`
++	 * being SET -- the opposite of what the env var's name implies, and
++	 * inconsistent with other check sites of the same var in this file. See
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis. Defined in
++	 * pimEntitlementRefresh.cxx:1014-1054.
++	 */
+ 	void EntitlementRefresh_updateCustomize();
++	/** Recomputes the "space needed / available" label and WGM pre-flight checks. Defined in pimEntitlementRefresh.cxx:1056-1201. */
+ 	void EntitlementRefresh_updateSpace();
++	/** Enables NextStepBtn based on pending updates/prerequisites; always enabled in reconfigure mode. Defined in pimEntitlementRefresh.cxx:1203-1322. */
+ 	void EntitlementRefresh_updateNextbtn();
++	/**
++	 * Disk-space gate for the Applications-screen Next button.
++	 * CONFIRMED BUG: a missing `else` before the unconditional
++	 * `GetSize(dbl)` call silently discards the "already installed, same
++	 * version" and "parent-only" special-case size calculations -- see
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis. Defined in
++	 * pimEntitlementRefresh.cxx:1424-1479.
++	 */
+ 	bool IsSufficientSpace();
+ 	void SetLicSourceBtnVisible(bool visiblility);
+ 	void SetLicSourceBtnSensitive(bool sensitivity);
+ 	bool GetLicSourceBtnVisibility();
+ 	bool GetLicSourceBtnSensitivity();
+ 
++	/** Formats and stores a PORT_VALIDATION_WARNING result for the given warning kind. */
+ 	template<typename ...Types>
+ 	void SetPortWarning(PORT_WARNING, Types... args);
+ 
++	/**
++	 * Formats and stores a PORT_VALIDATION_ERROR result for the given error
++	 * kind. CONFIRMED: PORT_OUT_OF_RANGE_ERROR and PORT_INVALID_FORMAT_ERROR
++	 * both resolve to the same message id (pimUIPortsInvalidFormat) -- see
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 */
+ 	template<typename ...Types>
+ 	void SetPortError(PORT_ERROR, Types... args);
++
++	/** @return The most recently set port-validation outcome (a single shared result, not per-port). */
+ 	ValidationResult GetPortsValidationResult();
+ 
++	/** Resets the shared port-validation result to PORT_VALIDATION_SUCCESS. */
+ 	void SetPortsValidationSuccess();
+ 	
+ private:
+@@ -742,10 +860,26 @@
+ 	void LicenseIDRefresh();
+ 	void LicenseIDNextBackPreAction();
+ 	void LicenseSourceUpdateUI();
++	/** WGM-mode-only Next-button guard: blocks with a "customize_pkg" balloon if any non-update entitlement has a 0-byte computed size. Defined in pimEntitlementRefresh.cxx:1481-1505. */
+ 	bool ApplicationsNextPreAction();
++	/** Resets currentProduct, re-points mAppFeaturesTree, calls CustomEntitlementRefresh(); always returns false. Defined in pimEntitlementRefresh.cxx:1508-1514. */
+ 	bool CustomizeNextPreAction();
++	/** Lazily constructs AvailableDownloads and drives SearchForAvailableDownloads() to completion, then LocateAllowPTCDotCom(true, ...). Defined in pimEntitlementRefresh.cxx:279-302. */
+ 	bool EntitlementDownloadPreAction();
++	/**
++	 * Applications-screen top-level per-mode entry point (new/reconfigure).
++	 * CONFIRMED BUG: the School- and Beta-mode trial-license wait loops
++	 * inside this method (pimEntitlementRefresh.cxx:466-471, 535-539) use
++	 * `while (test == NULL || ++max >= 40)` -- because `||` short-circuits,
++	 * `++max` is never evaluated while `test` stays NULL, so the loop never
++	 * terminates if the license never parses (no timeout, no error dialog).
++	 * The sibling Trial-mode loop a few lines above (:376-401) uses the
++	 * correct `&&`/`<=` guard and has the error-dialog fallback. See
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis. Defined in
++	 * pimEntitlementRefresh.cxx:304-750.
++	 */
+ 	void EntitlementRefresh();
++	/** Rebuilds ApplicationsTree for the active new/reconfigure/new_download sub-mode and calls all 4 EntitlementRefresh_update*() methods. Defined in pimEntitlementRefresh.cxx:754-1012. */
+ 	void EntitlementRefresh_low();
+ 	
+ 	void ProgressRefresh();
+@@ -755,26 +889,86 @@
+ 	bool ShowSAB();
+ 	bool HideSAB();
+ 	bool IsSABTextMode();
++
++	/** Registers the app-features tree search widget (mAppFeaturesFilter) and its activate/input callbacks. */
+ 	void initAppSettingsSearch();
+ 	static int searchActivateCB(SrchWdgHdl handle, const wchar_t *input_text,
+                                      void *treeSearchHndl);
++
++	/** Re-applies dark/light-mode style parts to every major layout when the OS dark-mode setting changes. */
+ 	static int checkDarkModeCB(void* data1, void* data2);
++
++	/** @return The current UI toolkit dark-mode factor (> 0 means dark mode is active). */
+ 	static int getDarkModeFactor();
++
++	/**
++	 * Sets one of the 3 license-server port values and clears its cached
++	 * availability/busy-indicator state.
++	 * @param portType Which port to set.
++	 * @param portStr New port value.
++	 */
+ 	void SetPortValue(const LICENSE_SERVER_PORT& portType, btkString &portStr);
++
++	/** @return The current value of the given port. */
+ 	btkString GetPortValue(const LICENSE_SERVER_PORT& portType) const;
+ 
++	/** @return Whether the given port was last found available. */
+ 	bool GetPortStatus(const LICENSE_SERVER_PORT &portType);
++
++	/** Restores a port to the session's default value via pimGetSessionInfo()->GetDefaultPortValues(). */
+ 	void ResetPort(const LICENSE_SERVER_PORT& portType);
++
++	/** Validates the Primary or Secure port via SetPortStatusLow(); returns false for any other port type. */
+ 	bool SetPortStatus(const LICENSE_SERVER_PORT& portType);
++
++	/**
++	 * Shared port-validation implementation: treats an empty value or the
++	 * literal "0" as a valid "unset" sentinel; otherwise checks numeric
++	 * format, the 1024-65535 range, collision with the lmgrd port, and
++	 * whether the port is already in use by another process
++	 * (pimisPortAvailableForFlexNet()), auto-expanding the Vendor Daemon
++	 * Ports section and setting the busy-icon/help-text on any failure.
++	 * @return true if the port is available for use.
++	 */
+ 	bool SetPortStatusLow(PortInfo& portObj, uiInputPanel& portInputPanel, uiLabel& busyWidget);
++
++	/** Populates all 3 ports (Primary, Secure, Lmgrd) via pimPopulatePort(). */
+ 	void pimInitializePorts(const btkString& licenseDotDat);
+ 	void pimPopulatePort(const LICENSE_SERVER_PORT& portType, const btkString& licenseDotDat);
+ 	void ShowPortModificationGuidelines();
++
++	/**
++	 * Top-level port validation entry point: checks Port != Eport, then
++	 * validates the Primary port via SetPortStatus(). CONFIRMED: the Secure
++	 * (Eport) validation call here is deliberately commented out, matching
++	 * the dated "$$90 Temporary EPORT Disablement" revision entry -- not a
++	 * bug. See docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return true if validation passed.
++	 */
+ 	bool SetAndValidateLicenseServerPorts();
+ protected:
++	/**
++	 * Steps the wizard backward one screen via a hardcoded if/else-if chain
++	 * over CurrentLayout. CONFIRMED: the InstallationLayout ->
++	 * CustomizeAppsLayout branch here does NOT check currentProduct, unlike
++	 * StepForward()'s corresponding forward branch -- a confirmed guard
++	 * asymmetry, see docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return void
++	 */
+ 	void StepBack();
++
++	/**
++	 * Steps the wizard forward one screen via a hardcoded if/else-if chain
++	 * over CurrentLayout, mirroring (but not always symmetrically with)
++	 * StepBack().
++	 * @return void
++	 */
+ 	void StepForward();
++
++	/** Sets the Installation/InstallUpdate step's nav image to "current" and hides both done-labels. */
+ 	void pimTransitionToInstallStep();
++
++	/** Sets the Installation/InstallUpdate step's nav image to "success" and shows the appropriate done-label based on some_failed. */
+ 	void pimTransitionToFinishStep(bool some_failed = false);
+ 	void UpdateUI();
+ 
+@@ -784,6 +978,52 @@
+ 	void InitSAB(void *);
+ 
+ 	bool OnInputPanelInput(uiInputPanel&);
++	/**
++	 * Main wizard-button dispatch handler, pim_ui_src/pimInstallMgrActions.cxx:643-1193
++	 * (551 lines). Fully traced in a further pass; see
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis for complete detail.
++	 *
++	 * Two independent dispatch chains plus a common tail:
++	 *  - Chain 1: if/else-if over most wizard buttons (BackBtn, CancelBtn,
++	 *    per-screen Next buttons other than the main NextStepBtn, etc).
++	 *  - Chain 2 (the &pushed==&NextStepBtn branch, :782-1041): a second,
++	 *    much larger if/else-if over CurrentLayout, one arm per wizard
++	 *    screen, calling into pimSessionInfo::TryAuthorize()/
++	 *    GetTrialLicense()/GetSchoolLicense()/GetBetaLicense() (see
++	 *    docs/classes/pimSessionInfo.md Risk Analysis) and into the
++	 *    OnFinishFromEula()/OnFinishFromBetaEula() screen handlers.
++	 *  - Common tail (:1184+): unconditional Refresh() after both chains.
++	 *
++	 * CONFIRMED BUGS (control-flow traced; see docs/classes/pimInstallMgrDlg.md
++	 * Risk Analysis for full excerpts):
++	 *  - EULA-decline-order bug (HIGH): the EULA screen's arm calls
++	 *    EulaNextPreAction() (kicks off license acquisition) BEFORE checking
++	 *    whether the user declined the license, the reverse of the Beta EULA
++	 *    arm's (correct) decline-checked-first order.
++	 *  - Refresh()-after-Destroy(): OnFinishFromEula()/OnFinishFromBetaEula()
++	 *    both end with uiDialog::Destroy(), but their call sites here have no
++	 *    matching `return`, so execution falls through to the common
++	 *    Refresh() call on an already-destroyed dialog. Severity depends on
++	 *    uiDialog's own post-Destroy() semantics, which are outside this
++	 *    archive; flagged as confirmed-by-trace, not confirmed-fatal.
++	 *  - Disabled-Finish-button bug: answering "No" to the exit-confirmation
++	 *    prompt leaves NextStepBtn disabled even though the comment beside
++	 *    that branch reads "we are exiting" -- the label is on the
++	 *    non-exiting branch.
++	 *  - Re-entrancy / skip_ports_modification bug: pimTextDlg's "proceed
++	 *    anyway" response (pim_ui_src/pimTextDlg.cxx:82-98) re-enters this
++	 *    same method via GetMainUIDialog()->OnPushButtonActivate(NextStepBtn)
++	 *    after setting skip_ports_modification="Y", which is never reset.
++	 *
++	 * Further, lower-severity findings (see docs/classes/pimInstallMgrDlg.md):
++	 * chain 2's missing final `else`; last_license_btn set-order asymmetry;
++	 * asymmetric undo of mCmdEdt; a currentProduct null-deref risk;
++	 * MultipleHostIDButton's array-size mismatch; the busy cursor never
++	 * being cleared on some paths; dual reconfigure-mode-read sources; and
++	 * ResetPort/EportReset covering only 2 of the 3 ports.
++	 *
++	 * @return true
++	 */
+ 	bool OnPushButtonActivate(uiPushButton &);
+ 	bool OnRadioGroupSelect (uiRadioGroup&, cStringT);
+ 	bool OnCheckButtonActivate (uiCheckButton&);
+@@ -795,34 +1035,108 @@
+ 	bool OnMinimize();
+ 	bool OnRestore();
+ 	bool OnEscape();
++
++	/**
++	 * Confirms exit intent (unless complete_quiet_exit), checks
++	 * OKToExitProgress() if an install is in progress, runs pimCleanCache
++	 * synchronously (polled via Sleep(1000) until done, unless PIM_KEEP_CACHE
++	 * is set), then calls uiDialog::Exit(0)/Destroy(). CONFIRMED
++	 * near-identical to OnFinishFromEula()/OnFinishFromBetaEula() -- see
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return UI_SUCCESS.
++	 */
+ 	bool OnClose();
++
++	/** Near-identical to OnClose(); see that method's doc and docs/classes/pimInstallMgrDlg.md Risk Analysis. */
+ 	bool OnFinishFromEula();
++
++	/** Near-identical to OnClose(); see that method's doc and docs/classes/pimInstallMgrDlg.md Risk Analysis. */
+ 	bool OnFinishFromBetaEula();
+ 	bool OnHelp();
+ 	bool OnMove();
+ 
++	/**
++	 * Customize-tab selection dispatcher; calls the matching RefreshXTab()
++	 * for the newly-selected tab. CONFIRMED: the Help/Advanced branch is
++	 * entirely commented out (see docs/classes/pimInstallMgrDlg.md Risk
++	 * Analysis) -- RefreshHelpTab() is unreachable from here.
++	 * @return UI_SUCCESS.
++	 */
+ 	bool OnTabSelect(uiTab&, cStringT);
+ 	bool OnListSelect(uiList &List, int N, char *Sel[]);
+ 	bool OnCustomHelp();
+ 
+ 	void CustomEntitlementRefresh();
++
++	/**
++	 * Rebuilds the Customize Apps tab list based on
++	 * currentProduct->SupportCustomize(...) checks, sets the App Features
++	 * tree's entitlement directly (mAppFeaturesTree.SetEntitlement()), and
++	 * dispatches OnTabSelect() for the resulting current tab.
++	 * @return The result of the OnTabSelect() dispatch, or false if currentProduct is NULL.
++	 */
+ 	bool RefreshDlg();
++
++	/**
++	 * Propagates a selected parent entitlement's language/platform choices
++	 * onto its dependent child entitlements (matched by
++	 * GetRequiredParentEntitlement()). CONFIRMED duplicated near-verbatim in
++	 * the nested uiCustomAppTree class in this same file -- see
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return true (always).
++	 */
+ 	bool UpdateParentEntitlements(); // called on OK exit request
++
++	/**
++	 * WGM-specific: propagates a "uwgm.xml" base entitlement's selected
++	 * platforms onto its adapter entitlements. CONFIRMED duplicated
++	 * near-verbatim in the nested uiCustomAppTree class -- see
++	 * docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return true (always).
++	 */
+ 	bool UpdateChildEntitlements(); // called on OK exit request
+ 
++	/**
++	 * Populates the Shortcuts customize tab from the first shortcut id in
++	 * currentProduct's XML (via pimShortcutMgr), and the environment-choice
++	 * radio group if ShowEnvironmentChoice() allows it.
++	 * @return true if currentProduct has at least one shortcut.
++	 */
+ 	bool RefreshShortcutsTab();
++
++	/**
++	 * CONFIRMED permanent no-op (always returns false) despite being
++	 * dispatched by OnTabSelect() on every Application-Features tab
++	 * selection -- the tab's actual refresh happens via
++	 * mAppFeaturesTree.SetEntitlement(), called directly from RefreshDlg().
++	 * See docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return false (always).
++	 */
+ 	bool RefreshFeatureTab();
+ 	bool RefreshCommandCfgTab();
+ 	bool RefreshLicensesTab();
++
++	/**
++	 * Populates the Help/Advanced customize tab from pimHelpMgr. CONFIRMED
++	 * unreachable from OnTabSelect() (that dispatch branch is commented
++	 * out) -- see docs/classes/pimInstallMgrDlg.md Risk Analysis.
++	 * @return true if currentProduct is set.
++	 */
+ 	bool RefreshHelpTab();
+ 	bool RefreshMiscTab();
+ 	bool IsPortsModificationAllowed();
+ 	void SetHelpModeSAB(bool tf);
+ 
+-	// for flex install we need to ensure that if applicable 
++	// for flex install we need to ensure that if applicable
+ 	// available Download Data is retrieved..
+-	// this function will do that or return immediately if 
++	// this function will do that or return immediately if
+ 	// it is unnecessary
++	/**
++	 * If AvailableDownloads hasn't finished its search, shows a modal
++	 * pimWaitDlg wrapping it as a pimLoop* until the search completes.
++	 * @param alternate_message Optional override for the wait dialog's message.
++	 * @return void
++	 */
+ 	void WaitForAvailableDownloadData(const char *alternate_message = NULL);
+ 
+     //friend class TriadTable;

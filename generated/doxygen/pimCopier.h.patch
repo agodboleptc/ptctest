@@ -1,0 +1,179 @@
+--- a/pim_core/includes/pimCopier.h
++++ b/pim_core/includes/pimCopier.h
+@@ -1,12 +1,12 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+   26-Nov-11 P-10-13   TWH   $$2    Add OnlyUninstallCopier
+   12-Dec-11 P-10-14   TWH   $$3    Update for Beta build
+   09-Jan-12 P-10-15   TWH   $$4    Add GetCopiedSize
+-  02-Feb-12 P-10-16   TWH   $$5    Add ::Release 
++  02-Feb-12 P-10-16   TWH   $$5    Add ::Release
+   03-Feb-15 P-30-01   MTH   $$6   display the copy and cab extraction failed error.
+ 
+ 
+@@ -18,6 +18,28 @@
+ #include <threadlibcxx.h>
+ #include <pimCopyLoop.h>
+ 
++/**
++ * Process-wide singleton "owner" wrapper around pimCopyLoop, the install
++ * step that copies files. One of 7 near-identical Loop-owner wrapper
++ * singletons in pim_core (pimCopier, pimMSICopier, pimSFXCopier,
++ * pimShortcuts, pimRegEdit, pimServices, pimDownloader).
++ *
++ * Uniquely among the 7, this class has TWO independent singleton instances:
++ * GetInstance() (OnlyCopier, for install-time copying) and
++ * GetUninstallInstance() (OnlyUninstallCopier, for uninstall/rollback
++ * copying). These are fully separate objects with their own mutexes and
++ * their own pimCopyLoop -- an install-copy and an uninstall-copy CAN run
++ * concurrently; two install-copies (or two uninstall-copies) cannot.
++ *
++ * Locking contract: Copy()/Rollback()/Uninstall() use a non-blocking
++ * TryLock() on an internal mutex and return 1 (true) if the lock was
++ * acquired and the copy started, or 0 (false) if another copy is already in
++ * progress on this instance (caller should retry after a sleep). The lock
++ * is held for the FULL DURATION of the copy, released only when Status()
++ * observes the copy is done, or when Kill()/Release() is called.
++ *
++ * Sole caller in this codebase: pimEntitlement.
++ */
+ class pimCopier
+ {
+ private:
+@@ -38,13 +60,34 @@
+ 	pimCopyLoop *CopyLoop;
+ 
+ public:
++	/**
++	 * @return The install-copy singleton (OnlyCopier), constructing it on
++	 *   first call.
++	 */
+ 	static pimCopier& GetInstance();
++
++	/**
++	 * @return The uninstall/rollback-copy singleton (OnlyUninstallCopier),
++	 *   constructing it on first call. Independent from GetInstance()'s
++	 *   instance -- separate lock, separate owned pimCopyLoop.
++	 */
+ 	static pimCopier& GetUninstallInstance();
+ 
+ protected:
+ 	pimCopier();
+ 	~pimCopier(){}
+ 
++	/**
++	 * Shared implementation behind Copy()/Rollback()/Uninstall(). Resolves
++	 * destination via [LP]; for install (non-uninstall) resolves source via
++	 * cachedir (or [SOURCE] if NoDownloadSupport is set) plus a hardcoded
++	 * "ptcsh0" subpath. Constructs and Execute()s a pimCopyLoop asynchronously
++	 * under xmlMutex.TryLock().
++	 * @param uninstall Configures the Loop for an uninstall-mode copy.
++	 * @param rollback Configures the Loop for a rollback-mode copy.
++	 * @param recopy Configures the Loop to ignore already-installed state.
++	 * @return true if the lock was acquired and the copy started; false if busy.
++	 */
+ 	int Copy_low(pimXmlFile *, bool uninstall = false, bool rollback = false, bool recopy = false);
+ 
+ private:
+@@ -61,13 +104,28 @@
+ 		Error
+ 	};
+ 
+-	// these use TRYLock 
++	// these use TRYLock
+ 	// return 1 if successfull and Download will happen
+ 	// return 0 if you should try again after a sleep
+-	// return negative if you should not try again 
+-	// 
++	// return negative if you should not try again
++	//
++	/**
++	 * Starts an install-copy. Non-blocking; delegates to Copy_low().
++	 * @param ignore_already_installed Skips the already-installed check.
++	 * @return 1 if started; 0 if another copy is in progress; negative on error.
++	 */
+ 	int Copy(pimXmlFile *, bool ignore_already_installed = false);
++
++	/**
++	 * Starts a rollback-mode copy (uninstall=true, rollback=true).
++	 * @return 1 if started; 0 if another copy is in progress; negative on error.
++	 */
+ 	int Rollback(pimXmlFile *);
++
++	/**
++	 * Starts an uninstall-mode copy.
++	 * @return 1 if started; 0 if another copy is in progress; negative on error.
++	 */
+ 	int Uninstall(pimXmlFile *);
+ 
+ 	// After Download() starts returns call Status
+@@ -75,29 +133,64 @@
+ 	// OUTPUTS:
+ 	// percent_downloaded 0 - 100
+ 	// estimate_remaining in seconds
++	/**
++	 * Polls the copy's progress. On first observing the copy is done, deletes
++	 * the owned pimCopyLoop and releases xmlMutex, allowing a new copy to
++	 * start.
++	 * @param percent_Copied Receives 0-100 percent-copied estimate.
++	 * @param estimate_remaining Receives estimated remaining time.
++	 * @return Current CopyStatus.
++	 */
+ 	CopyStatus Status(int &percent_Copied, btkTimeval &estimate_remaining);
+ 
+ 	// call only after IsDone && Status returns Idle
++	/** @return The final installed size, valid only after Status() returns Idle. */
+ 	double GetCopiedSize() { return copy_total; }
+ 
+ 	// Put into a hold after the current download file
+ 	// completes
++	/** Sets a caller-facing pause_flag reported by Status(); does not itself pause the copy thread. */
+ 	void Pause();
+ 
+ 	// Resume Pause
++	/** Clears pause_flag. */
+ 	void Resume();
+ 
+-	// Cancel - set cancel flag to stop after current download file 
++	// Cancel - set cancel flag to stop after current download file
+ 	// and release/reset all flags so another thread could start
++	/**
++	 * Sets cancel_flag AND calls the owned pimCopyLoop's Cancel() directly.
++	 * Note: does not null-check the Loop pointer first -- calling this when
++	 * no copy is in progress would dereference a NULL pointer.
++	 * @return void
++	 */
+ 	void Cancel();
+ 
+ 	// Release/reset all flags killing anything in progress
++	/**
++	 * If a copy is in progress, kills the owned pimCopyLoop, deletes it, and
++	 * releases xmlMutex immediately (does not wait for the killed thread to
++	 * finish tearing down).
++	 * @return void
++	 */
+ 	void Kill();
+ 
+ 	// Force Release - call if we have to release our use of the
+ 	// instance before we actually call "Execute"
++	/**
++	 * Unconditionally releases xmlMutex with no other cleanup. Documented for
++	 * use when a caller decided not to proceed after acquiring the lock's
++	 * intent.
++	 * @return void
++	 */
+ 	void Release();
+ 
++	/**
++	 * Proxies to the owned pimCopyLoop's GetErrors(); leaves out untouched if
++	 * no copy is in progress.
++	 * @param out Receives the accumulated error text.
++	 * @return void
++	 */
+ 	void GetErrors(btkString &out);
+ };
+ 

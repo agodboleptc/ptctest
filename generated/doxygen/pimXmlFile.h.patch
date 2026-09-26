@@ -1,0 +1,478 @@
+--- a/pim_core/includes/pimXmlFile.h
++++ b/pim_core/includes/pimXmlFile.h
+@@ -47,6 +47,16 @@
+ 
+ XERCES_CPP_NAMESPACE_USE
+ 
++/**
++ * Xerces ErrorHandler that records whether any parse error was seen, used
++ * by pimXmlFile to detect malformed product/session XML during DoRead().
++ *
++ * Responsibilities:
++ * - Track fSawErrors across warning()/error()/fatalError() callbacks.
++ *
++ * Dependencies:
++ * - xercesc::ErrorHandler (base class).
++ */
+ class DOMTreeErrorReporter : public ErrorHandler
+ {
+ public:
+@@ -58,10 +68,34 @@
+     ~DOMTreeErrorReporter()
+     {
+     }
++    /**
++     * @param toCatch The Xerces warning exception.
++     * @return void
++     */
+     void warning(const SAXParseException& toCatch);
++    /**
++     * Records the error (sets fSawErrors) and logs it.
++     *
++     * @param toCatch The Xerces error exception.
++     * @return void
++     */
+     void error(const SAXParseException& toCatch);
++    /**
++     * Records the fatal error (sets fSawErrors) and logs it.
++     *
++     * @param toCatch The Xerces fatal error exception.
++     * @return void
++     */
+     void fatalError(const SAXParseException& toCatch);
++    /**
++     * Resets fSawErrors to false.
++     *
++     * @return void
++     */
+     void resetErrors();
++    /**
++     * @return true if error() or fatalError() has been called since construction/resetErrors().
++     */
+     bool getSawErrors() const;
+ 
+     bool fSawErrors;
+@@ -72,9 +106,23 @@
+     return fSawErrors;
+ }
+ 
++/**
++ * Transcoding helper between Xerces' UTF-16 XMLCh strings and local
++ * (UTF-8) char strings, implemented via the btk string-conversion helpers
++ * (btk_u16stou8s_alloc/btk_u8stou16s_alloc) rather than raw
++ * XMLString::transcode, so ownership/freeing goes through btkStrFree.
++ *
++ * Dependencies:
++ * - btk_u16stou8s_alloc / btk_u8stou16s_alloc / btkStrFree (external btk).
++ */
+ class StrX
+ {
+ public:
++    /**
++     * Transcodes a Xerces UTF-16 string to a local-form (UTF-8) string.
++     *
++     * @param toTranscode The XMLCh string to transcode.
++     */
+     StrX(const XMLCh* const toTranscode)
+     {
+         // Call the private transcoding method
+@@ -82,6 +130,11 @@
+         fLocalForm = btk_u16stou8s_alloc(toTranscode);
+         fUnicodeForm = NULL;
+     }
++    /**
++     * Transcodes a local-form (UTF-8) string to a Xerces UTF-16 string.
++     *
++     * @param toTranscode The char string to transcode.
++     */
+     StrX(const char* const toTranscode)
+     {
+         // Call the private transcoding method
+@@ -104,11 +157,19 @@
+         }
+     }
+ 
++    /**
++     * @return The transcoded local-form (UTF-8) string, or NULL if this
++     *         instance was constructed from a char* (unicodeForm() case).
++     */
+     const char* localForm() const
+     {
+         return fLocalForm;
+     }
+ 
++    /**
++     * @return The transcoded Xerces UTF-16 string, or NULL if this instance
++     *         was constructed from an XMLCh* (localForm() case).
++     */
+     const XMLCh* unicodeForm() const
+     {
+         return fUnicodeForm;
+@@ -125,12 +186,21 @@
+     return target;
+ }
+ 
++/**
++ * Xerces DOMErrorHandler used during DOM writing/serialization to capture
++ * output-side errors (distinct from DOMTreeErrorReporter, which handles
++ * parse-side errors).
++ */
+ class DOMPrintErrorHandler : public DOMErrorHandler
+ {
+ public:
+     DOMPrintErrorHandler() {};
+     ~DOMPrintErrorHandler() {};
+ 
++    /**
++     * @param domError The Xerces DOM error to handle.
++     * @return true to continue processing, false to abort (per DOMErrorHandler contract).
++     */
+     bool handleError(const DOMError& domError);
+     void resetErrors() {};
+ 
+@@ -140,15 +210,35 @@
+ 
+ class FilterXArray;
+ 
++/**
++ * Xerces DOMLSSerializerFilter controlling which node types are included
++ * when a pimXmlFile document is serialized back out, set via
++ * pimXmlFile::SetFilter().
++ */
+ class DOMPrintFilter : public DOMLSSerializerFilter
+ {
+ public:
++    /**
++     * @param whatToShow Bitmask of DOMNodeFilter::SHOW_* flags selecting
++     *        which node types to include (default: SHOW_ELEMENT).
++     */
+     DOMPrintFilter(unsigned long whatToShow = DOMNodeFilter::SHOW_ELEMENT);
+     ~DOMPrintFilter() {}
+ 
++    /**
++     * @param toShow New SHOW_* bitmask.
++     * @return void
++     */
+     void setWhatToShow(unsigned long toShow) { fWhatToShow = toShow; };
++    /**
++     * @return The current SHOW_* bitmask.
++     */
+     unsigned long getWhatToShow() const { return fWhatToShow; };
+ 
++    /**
++     * @param node The DOM node being considered for serialization.
++     * @return The filter action (accept/reject/skip) for this node, per DOMLSSerializerFilter contract.
++     */
+     FilterAction acceptNode(const DOMNode*) const;
+ 
+ private:
+@@ -157,6 +247,36 @@
+ 
+ };
+ 
++/**
++ * Wraps Xerces-C++ DOM parsing/reading/writing for every XML document used
++ * by PIM (product/entitlement definitions, session state, translation
++ * files, image metadata), and layers a convenience
++ * "<PROPERTY name=\"X\">value</PROPERTY>"-style get/set API plus explicit
++ * read/write locking on top of raw DOM access.
++ *
++ * Responsibilities:
++ * - Parse (DoRead) and serialize (DoSave/DoWrite/DoWriteToDir) an XML document.
++ * - Provide SetProperty/GetProperty/IsPropertySet/GetTextNode convenience
++ *   accessors over PROPERTY-style elements.
++ * - Provide raw DOM traversal helpers (GetNextNodelistItem,
++ *   FindNodelistAttribMatch, GetChildNodeByNodeName).
++ * - Guard concurrent access via an explicit PreRead/PostRead,
++ *   PreWrite/PostWrite (and PushReadToWrite/PopWriteToRead upgrade)
++ *   protocol, since multiple pimLoop-derived threads may share one
++ *   entitlement's XML document.
++ * - Track parse errors (ErrorOccured) and content-changed state (ContentChanged).
++ *
++ * Dependencies:
++ * - Xerces-C++ DOM/parser/serializer APIs directly.
++ * - btkthrmutex.h (thrRWLock/thrMutex/btkThrMutex) for the locking protocol.
++ * - pimDefs.h for XML tag/attribute name constants.
++ *
++ * Thread safety: see PreRead/PreWrite/PushReadToWrite/PopWriteToRead below.
++ * This class's own revision history records "Fixed xml mutex issues"
++ * (Q-27-15) and "Added temporary logs to investigate locks issue" (Q-27-06)
++ * -- its locking protocol has been a real source of bugs, not merely a
++ * theoretical risk, and should be treated as high-risk to modify.
++ */
+ class pimXmlFile
+ {
+ private:
+@@ -207,77 +327,269 @@
+     pimXmlFile();
+     ~pimXmlFile();
+ 
++    /**
++     * Sets the source file path for a subsequent DoRead(), or the intended
++     * output name for a document being created fresh.
++     *
++     * @param xml Path to the XML file.
++     * @return void
++     */
+     void SetXml(const char* xml);
++    /**
++     * @param xsd Path to an XML schema to validate against when UseSchema() is enabled.
++     * @return void
++     */
+     void SetSchema(const char* xsd) { if (xsd) xsdfile = xsd; }
++    /**
++     * Enables namespace-aware parsing for subsequent DoRead() calls.
++     * @return void
++     */
+     void UseNS() { gDoNamespaces = true; }
++    /**
++     * Enables pretty-printed output for subsequent DoWrite()/DoSave() calls.
++     * @return void
++     */
+     void UsePrettyPrint() { gFormatPrettyPrint = true; }
++    /**
++     * Enables schema validation for subsequent DoRead() calls.
++     * @return void
++     */
+     void UseSchema() { gDoSchema = true; }
+ 
+     // call these when reading from the XML outside
+-    // of a class member function 
++    // of a class member function
+     // - they are automatically called within a class method such as GetProperty()
++    /**
++     * Acquires a shared (read) lock on this document. Automatically called
++     * internally by methods such as GetProperty(); must be called manually
++     * when performing multi-step raw DOM traversal outside a single
++     * convenience-method call.
++     *
++     * @return void
++     */
+     void PreRead();
++    /**
++     * Releases the shared (read) lock acquired by PreRead().
++     * @return void
++     */
+     void PostRead();
++    /**
++     * @return true if one or more readers currently hold the read lock (mReadingCount > 0).
++     */
+ 	bool ReadLockEngaged() { return (mReadingCount > 0); }
+ 
+     // call these when writing to the XML outside
+-    // of a class member function 
++    // of a class member function
+     // - they are automatically called within a class method such as SetProperty()
++    /**
++     * Acquires the exclusive (write) lock on this document. Automatically
++     * called internally by methods such as SetProperty(); must be called
++     * manually when performing multi-step raw DOM mutation outside a single
++     * convenience-method call.
++     *
++     * @return void
++     */
+     void PreWrite();
++    /**
++     * Releases the exclusive (write) lock acquired by PreWrite().
++     * @return void
++     */
+     void PostWrite();
++    /**
++     * @return true if the write lock is currently held (wLockEngaged).
++     *         Consulted by pimLoop::Kill() to release a stuck write lock
++     *         when a Loop thread is force-terminated.
++     */
+     bool WriteLockEngaged() { return wLockEngaged; }
+ 
+ #if 1
++    /**
++     * Upgrades a currently-held read lock to a write lock in place.
++     * @return void
++     */
+     void PushReadToWrite();
++    /**
++     * Downgrades a write lock (acquired via PushReadToWrite()) back to a read lock.
++     * @return void
++     */
+     void PopWriteToRead();
+ #endif
+ 
++    /**
++     * Parses the document from the path set via SetXml(), populating doc.
++     * Sets errorsOccured if a parse error is reported by errReporter.
++     *
++     * @return void
++     */
+     void DoRead();
++    /**
++     * Parses the document from an in-memory buffer instead of a file.
++     *
++     * @param input The Xerces memory buffer input source.
++     * @return void
++     */
+     void DoRead(MemBufInputSource& input);
++    /**
++     * Restores this document's content from a backup file path.
++     *
++     * @param input_file_path Path to the backup XML file.
++     * @return true on success.
++     */
+     bool RestoreFromBackup(const char* input_file_path);
+ 
++    /**
++     * Serializes the document back to its original file path and clears changeInContent.
++     * @return void
++     */
+     void DoSave(); // resets changeInContent flag
++    /**
++     * Serializes the document to the given output file path.
++     *
++     * @param output_file_path Destination path.
++     * @return void
++     */
+     void DoWrite(const char* output_file_path);
++    /**
++     * Serializes the document into the given directory, using this document's own file name.
++     *
++     * @param DirPath Destination directory.
++     * @return true on success.
++     */
+     bool DoWriteToDir(cStringT DirPath);
+ 
++    /**
++     * Clears the errorsOccured flag.
++     * @return void
++     */
+     void ResetErrors() { errorsOccured = false; }
++    /**
++     * @return true if the most recent DoRead() reported a parse error.
++     */
+     bool ErrorOccured() { return errorsOccured; }
+ 
++    /**
++     * @param tf New value for the content-changed (dirty) flag.
++     * @return void
++     */
+     void SetContentChangedFlag(bool tf) { changeInContent = tf; }
++    /**
++     * @return true if the document has been modified since the last DoSave()/ResetErrors().
++     */
+     bool ContentChanged() { return changeInContent; }
+ 
++    /**
++     * Installs an output filter controlling which node types are serialized.
++     *
++     * @param in The filter to use, or NULL to clear a previously-set filter and show everything unfiltered.
++     * @return void
++     */
+     void SetFilter(DOMPrintFilter* in);
+ 
++    /**
++     * @return The document's name as set via SetXml()/internal naming.
++     */
+     const char* GetXMLName() { return xmlname; }
+     // if a filter is set it will apply to these...
+     // so call SetFilter(NULL) (if previously set)
+     // if you want to show everything unfiltered.
+     //
++    /**
++     * @return The document's serialized contents as a wide string, subject to any active filter (SetFilter()).
++     */
+     const wchar_t* GetXMLContents();
+ 
+     // utility
++    /**
++     * @return The underlying Xerces DOMDocument. Caller must bracket raw
++     *         traversal with PreRead()/PostRead() or PreWrite()/PostWrite().
++     */
+     DOMDocument* getDocument() { return doc; }
++    /**
++     * @return The file path this document was loaded from / will be saved to.
++     */
+     cStringT getFilePath() { return (cStringT)xmlfile; }
+ 
+     // <PROPERTY name="<matching str>" attrib="foo">TextNode</PROPERTY>
+     // if attrib is set the value is set to an attrib of that name; or the attrib is created
+     // if attrib is not set the value becomes child TEXTNODE
+     //
++    /**
++     * Sets a PROPERTY-style element's value, creating the element/attribute
++     * if it does not already exist. Internally brackets the mutation with
++     * PreWrite()/PostWrite().
++     *
++     * @param name The PROPERTY element's "name" attribute to match.
++     * @param value The value to store.
++     * @param attrib When non-null, stores value as this attribute of the
++     *        matched element instead of as its text-node content.
++     * @return true if the property was found/created and set.
++     */
+     bool SetProperty(const char* name, const char* value, const char* attrib = NULL);
++    /**
++     * Reads a PROPERTY-style element's value. Internally brackets the read
++     * with PreRead()/PostRead().
++     *
++     * @param name The PROPERTY element's "name" attribute to match.
++     * @param value Receives the found value.
++     * @param attrib When non-null, reads this attribute instead of the
++     *        element's text-node content.
++     * @return true if the property was found.
++     */
+     bool GetProperty(const char* name, btkString& value, const char* attrib = NULL);
++    /**
++     * @param name The PROPERTY element's "name" attribute to check.
++     * @return true if a matching PROPERTY element exists.
++     */
+     bool IsPropertySet(const char* name);
++    /**
++     * Reads a named element's text-node content and attributes.
++     *
++     * @param ID The element name/id to match.
++     * @param attribs Receives the element's attribute list.
++     * @param value Receives the element's text-node content.
++     * @return true if the element was found.
++     */
+     bool GetTextNode(const char* ID, StringXArray& attribs, btkString& value);
++    /**
++     * Sets the text-node content of every element matching the given tag name.
++     *
++     * @param tag The element tag name to match, in Xerces UTF-16 form.
++     * @param value The new text-node content to apply to every match.
++     * @return true if at least one element was updated.
++     */
+     bool SetAllMatchingTextNodes(const XMLCh tag[], const char* value);
+ 
+     // NOTE: see above notes on PreWrite and PreRead
+-    //       one of the above should always be called 
++    //       one of the above should always be called
+     //       while working with the below utility functions.
+     //
++    /**
++     * Finds a node in the given node list whose given attribute matches matchstring.
++     *
++     * @param _NodeListID Tag name identifying the node list to search.
++     * @param _attribID Attribute name to compare.
++     * @param matchstring Value to match against the attribute.
++     * @return The matching DOMNode, or NULL if none matched.
++     */
+     DOMNode* FindNodelistAttribMatch(const XMLCh _NodeListID[],
+         const XMLCh _attribID[], const char* matchstring);
+ 
++    /**
++     * Stateful iterator over all elements matching the given tag name,
++     * tracked internally via GNNI_nl/GNNI_index/GNNI_lastList.
++     *
++     * @param _NodeListID Tag name to iterate.
++     * @param reset When true, restarts iteration from the first match; when
++     *        false, continues from the previous call's position.
++     * @return The next matching DOMNode, or NULL when iteration is exhausted.
++     */
+     DOMNode* GetNextNodelistItem(const XMLCh _NodeListID[], bool reset = false);
+ 
++    /**
++     * @param node Parent DOM node to search.
++     * @param Name Child element tag name to match.
++     * @return The first matching child DOMNode, or NULL if none matched.
++     */
+     DOMNode* GetChildNodeByNodeName(DOMNode*, const XMLCh Name[]);
+ 
+ };

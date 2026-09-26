@@ -1,0 +1,67 @@
+--- a/pim_core/includes/pimGetAvailable.h
++++ b/pim_core/includes/pimGetAvailable.h
+@@ -18,19 +18,43 @@
+ #include <pimGetAvailableProduct.h>
+ 
+ 
++/**
++ * A pimLoop subclass (the 10th confirmed one in this codebase, previously
++ * uncatalogued as part of that family -- see docs/classes/pimGetAvailable.md)
++ * that runs the web-media "what products/versions are available to
++ * download" search on a background thread: authenticates to PTC.com, walks
++ * the media-availability feed, retrieves and filters each candidate
++ * product's definition XML, and registers survivors via
++ * pimSessionInfo::AddEntitlement(). Owned as pimInstallMgrDlg::AvailableDownloads
++ * (pim_ui), with a fragile-but-currently-safe raw-pointer alias also held by
++ * pim_core/pimLocate.cxx (see the class doc's Ownership Model).
++ */
+ class pimGetAvailable : public pimLoop
+ {
+ private:
+ 	pimSessionInfo *SessionInfo;
+ 	pimGetAvailableProducts AvailableProductsArray;
++	/**
++	 * CONFIRMED WRONG COMMENT: despite this declaring comment, `0` is set
++	 * exactly when authentication has FAILED (MSG_A_NOACCOUNT/
++	 * MSG_INVALID_AUTHID), not on success; the real success value is `1`
++	 * (set in OnExecute() after a successful pimEntitlementRequestToPTC()),
++	 * which this comment does not mention at all. `-3` is set only for a
++	 * "should never happen" internal security-lookup failure inside
++	 * OnExecute() -- see docs/classes/pimGetAvailable.md Risk Analysis.
++	 */
+ 	int auth_status;  // -3 abort, 0 success
+ 	StringXArray family_grp;
++	/** Redundant with family_grp.GetSize() -- always updated/reset in lockstep with it; not itself a bug, just an unnecessary duplicated invariant. */
+ 	int family_count;
+ 
+ protected:
++	/** Thread entry point: fetches/parses/filters the availability feed and registers surviving products as entitlements. CONFIRMED: leaks its local `ImageXml` on the success path and `ProductDefinitionXml` on 2 filtered-out paths -- see docs/classes/pimGetAvailable.md Risk Analysis. */
+ 	void OnExecute();
++	/** Standard thread teardown: releases the per-thread logger, sets mDone under Mutex, calls the inherited ClearInProgress(). */
+ 	void OnTerminate();
+ 
++	/** Resolves or prompts (via pimNonBrowserAuthenticationCB(), the pimAuthDlg-backed callback) for PTC.com credentials for both the general Production URL and the Media Production URL. */
+ 	bool GetSecurity(bool retry);
+ 
+ public:
+@@ -45,8 +69,19 @@
+ 	}
+ 
+ 	// call from main thread.
++	/**
++	 * Synchronous auth pre-check, then starts the background search on
++	 * success. @return `1` (true) on success (background thread started),
++	 * `0` (false) if the account/auth-ID check failed (retryable -- the
++	 * confirmed caller, pimInstallMgrDlg::EntitlementDownloadPreAction(),
++	 * retries with `retry=true` on the next call), or `-3` on any other
++	 * abort (including GetSecurity() itself failing, e.g. a cancelled
++	 * credential prompt).
++	 */
+ 	int SearchForAvailableDownloads(bool retry); // returns immediately
+-	int IsAuthorized(); 
++	/** Mutex-protected read of auth_status. CONFIRMED: zero callers anywhere in this archive -- dead public API. */
++	int IsAuthorized();
++	/** Wraps the inherited IsDone(); additionally calls SessionInfo->Save() the first time it observes completion. */
+ 	bool IsSearchDone();
+ 
+ 	int GetSize(); // how many unique Download Names

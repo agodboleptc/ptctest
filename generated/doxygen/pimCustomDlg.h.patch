@@ -1,0 +1,225 @@
+--- a/pim_ui/includes/pimCustomDlg.h
++++ b/pim_ui/includes/pimCustomDlg.h
+@@ -28,6 +28,17 @@
+ #include <pimLanguageMgr.h>
+ #include <pimPlatformMgr.h>
+ 
++/**
++ * @brief Application Features/Languages/Platforms checkbox tree for pimCustomDlg's
++ *        "Application Features" tab.
++ *
++ * Owns CurrentPkgMgr/CurrentLangMgr/CurrentPlatMgr (XNew'd in SetEntitlement(),
++ * deleted there and in the destructor). CONFIRMED: the 4-argument Refresh()
++ * overload always returns false regardless of success (see pimCustomDlg.cxx);
++ * every traced caller discards the value, so this is currently inert.
++ * TreeCkBtns is declared but never populated or read anywhere in this class --
++ * confirmed dead member. See docs/classes/pimCustomDlg.md Risk Analysis #6-#7.
++ */
+ class uiCustomTree : public uiTree
+ {
+ private:
+@@ -39,21 +50,30 @@
+ 	bool reconfigure_mode;
+ 	bool needs_refresh;
+ 
+-	dsXArray <uiCheckButton *> TreeCkBtns;
++	dsXArray <uiCheckButton *> TreeCkBtns; ///< Confirmed dead: never populated or read.
+ 
+ 	bool RefreshPkg(pimPackageMgr *Pkg, const char *add, const char *after);
+ public:
+ 	uiCustomTree(cStringT Id);
+ 	~uiCustomTree();
+ 
++	/// Rebinds the tree to a new entitlement, deleting/recreating the 3 Mgr helpers.
+ 	bool SetEntitlement(pimEntitlement *, bool);
+ 	bool Refresh();
+ protected:
+ 	bool OnUpdate (char *Node, int State);
++	/// CONFIRMED: always returns false, even on success -- see class comment.
+ 	bool Refresh(pimPackageMgr *Pkg, pimLanguageMgr *Lang, pimPlatformMgr *Plat, bool no_expand);
+ 	bool Init(); // call when we reset the Current Mgr classes; ie we need to init the whole tree
+ };
+ 
++/**
++ * @brief The product picker list for pimCustomDlg's Customize dialog.
++ *
++ * CONFIRMED: RefreshList() is an empty no-op. The actual product-list
++ * population happens directly in pimCustomDlg::EntitlementRefresh() via the
++ * base uiList API (Clear()/Append()/Refresh()), not through this method.
++ */
+ class uiCustomAppList : public uiList
+ {
+ private:
+@@ -62,15 +82,24 @@
+ public:
+ 	uiCustomAppList(cStringT Id);
+ 	~uiCustomAppList();
++	/// Confirmed no-op (empty body); see class comment.
+ 	void RefreshList();
+ 
+ 	void SetSessionInfo(pimSessionInfo *S) { SessionInfo = S;}
+ 	double GetSizeSelected() { return total_size_selected; }
+ protected:
+ 	bool OnUpdate (char *Selected, int state);
+-	
++
+ };
+ 
++/**
++ * @brief Simulated-license-types table for the Simulated Licenses tab.
++ *
++ * Dynamically creates one row + one uiInputPanel per entry in the
++ * SimulateLicenseTypes XML property. Its AddInputPanel()/DeleteRows() are
++ * near-duplicate implementations of pimMiscTable's own methods of the same
++ * name -- see docs/classes/pimCustomDlg.md Risk Analysis #5.
++ */
+ class pimSimulateLicenseTable : public uiTable
+ {
+ private:
+@@ -88,6 +117,16 @@
+ 	bool initialized;	
+ };
+ 
++/**
++ * @brief Misc-user-input (<USER_INPUT> XML nodes) table for the Misc User
++ *        Inputs tab.
++ *
++ * Builds one row + one uiInputPanel ("IP" type) or uiOptionMenu ("List" type)
++ * per <USER_INPUT> node. OnOptionMenuSelect() independently re-walks the
++ * <USER_INPUT> DOM node list to find/set the matching node's text content --
++ * a near-duplicate of pimCustomDlg::OnInputPanelInput()'s own DOM walk for
++ * the input-panel case. See docs/classes/pimCustomDlg.md Risk Analysis #5.
++ */
+ class pimMiscTable : public uiTable
+ {
+ private:
+@@ -114,6 +153,14 @@
+ 	bool initialized;	
+ 	
+ };
++/**
++ * @brief Command Configuration tab's row list.
++ *
++ * Init() stashes borrowed pointers to the Add/Edit/Delete buttons so
++ * OnSelect() can toggle their sensitivity based on selection count and
++ * pimCommandMgr::CanDeleteCommand(). Has a near-identical structural
++ * counterpart, pimInstallMgrDlg.h's pimCustomCommandTable.
++ */
+ class pimCommandTable : public uiTable
+ {
+ private:
+@@ -132,6 +179,32 @@
+ friend class pimCustomDlg;
+ };
+ 
++/**
++ * @brief Standalone "Customize Application Settings" popup dialog for one
++ *        entitlement at a time (shortcuts, features, commands, simulated
++ *        licenses, misc user inputs, and a disabled Help/Advanced tab).
++ *
++ * CONFIRMED LIVE (not superseded/dead): 2 confirmed call sites --
++ * pimInstallMgrDlg::OnPushButtonActivate()'s CustomizeBtn branch
++ * (pim_ui_src/pimInstallMgrActions.cxx:649) and
++ * pimEntitlementTree::OnPushButtonActivate()'s per-row customize-icon handler
++ * (pim_ui_src/pimEntitlementTree.cxx:1338). Implements the SAME feature set as
++ * pimInstallMgrDlg's own embedded Customize tab-set via an independent,
++ * structurally near-identical code path -- see
++ * docs/classes/pimCustomDlg.md Risk Analysis #3 for the specific overlap.
++ *
++ * CONFIRMED BUGS (see docs/classes/pimCustomDlg.md Risk Analysis for full
++ * detail, evidence, and line citations):
++ *  - SetSABPath()/DisableSAB()/EnableSAB() (defined in pim_ui_src/pimSAB.cxx)
++ *    all guard on main_dlg_sab_handle, a static owned by pimInstallMgrDlg, not
++ *    this class's own help_dlg_sab_handle -- currently masked only because
++ *    pimInstallMgrDlg::InitSAB() has always already run by the time either
++ *    confirmed caller can reach Display().
++ *  - pimEntitlementTree's per-row customize icon resolves the specific
++ *    pimEntitlement for that row but never passes it to this class --
++ *    Initialize() has no parameter for a target entitlement, so the dialog
++ *    always opens on the first eligible product, not the one clicked.
++ */
+ class pimCustomDlg : public uiDialog
+ {
+ private:
+@@ -172,45 +245,78 @@
+ public:
+ 	pimCustomDlg();
+ 	~pimCustomDlg();
++	/// Idempotent; reads INSTALLMODE_PROPERTY for reconfigure_mode, calls InitSAB().
++	/// Contains a confirmed #if 0-disabled Windows-7 taskbar-pin block (dead code).
+ 	bool Initialize(pimSessionInfo *);
++	/// Populates the product picker (EntitlementRefresh()), then runs the modal
++	/// uiDialog::Activate() event loop. Returns 1 (OK) / 0 (Cancel).
+ 	bool Display();
++	/// CONFIRMED BUG (pimSAB.cxx): guards on main_dlg_sab_handle (pimInstallMgrDlg's
++	/// static) instead of this class's own help_dlg_sab_handle -- see class comment.
+ 	bool SetSABPath(const char *in);
+ 	void ChangedSABPathTo(const char *in);
+ 	bool IsSABTextMode();
+-	
++
+ private:
+ 	bool initialized;
+ 	bool reconfigure_mode;
+ 	pimSessionInfo *SessionInfo;
+ 
+ 	void InitSAB(void *SessionInfo);
+-	
++
+ protected:
+ 	bool OnTabSelect (uiTab&, cStringT);
++	/// The 4 shortcut-location checkboxes correctly use their own loop index into
++	/// GetAllShortcutIDs() -- contrast with pimSilent.cxx's pimSilentFixupShortcuts()
++	/// confirmed array-index bug (see docs/classes/pimShortcutMgr.md).
+ 	bool OnCheckButtonActivate (uiCheckButton&);
++	/// Walks <USER_INPUT> DOM nodes for a name match -- near-duplicate of
++	/// pimMiscTable::OnOptionMenuSelect()'s own DOM walk for the option-menu case.
+ 	bool OnInputPanelInput(uiInputPanel &);
++	/// mStdBtnOK: UpdateParentEntitlements() (normal) or UpdateChildEntitlements()
++	/// (WGM mode) then Exit(1). mStdBtnCancel: restores every candidate entitlement
++	/// from backup then Exit(0). mCmdAdd/mCmdEdt/mCmdDel: delegate to pimCmdCfgDlg
++	/// or pimCommandMgr::DeleteCommand() directly.
+ 	bool OnPushButtonActivate(uiPushButton &);
+ 	bool OnRadioGroupSelect(uiRadioGroup &, cStringT);
+ 	bool OnListSelect(uiList &List, int N, char *Sel[]);
+ 	bool OnOptionMenuSelect (uiOptionMenu &menu, cStringT selected)	;
++	/// Single-line delegate to OnPushButtonActivate(mStdBtnCancel) -- no duplicated
++	/// cleanup logic here (contrast with pimInstallMgrDlg's confirmed 3-way
++	/// OnClose()/OnFinishFromEula()/OnFinishFromBetaEula() duplication).
+ 	bool OnClose();
+ 	bool OnHelp();
+-	
++
++	/// Populates mCustomizableProducts and backs up every candidate entitlement's
++	/// XML file (restored on Cancel via OnPushButtonActivate()).
+ 	void EntitlementRefresh();
+ 	bool RefreshDlg();
++	/// Called on OK exit request. Near-duplicate of pimInstallMgrDlg's own
++	/// same-named method -- see docs/classes/pimCustomDlg.md Risk Analysis #3
++	/// for the one confirmed structural difference found between the two copies.
+ 	bool UpdateParentEntitlements(); // called on OK exit request
++	/// Called on OK exit request, WGM mode only (uwgm.xml base -> adapter children).
+ 	bool UpdateChildEntitlements(); // called on OK exit request
+ 
+ 	bool RefreshShortcutsTab();
++	/// CONFIRMED: unconditional `return false;` no-op. Believed benign here (the
++	/// actual tree refresh happens in uiCustomTree::SetEntitlement()/Refresh(),
++	/// called directly from RefreshDlg()) -- not proven for pimInstallMgrDlg's
++	/// identical-looking finding. See docs/classes/pimCustomDlg.md.
+ 	bool RefreshFeatureTab();
+ 	bool RefreshCommandCfgTab();
+ 	bool RefreshLicensesTab();
++	/// CONFIRMED: OnTabSelect()'s dispatch branch for this tab is commented out,
++	/// and mHelpAdvanced is never AddComponent()'d or AddLayout()'d -- unreachable.
+ 	bool RefreshHelpTab();
+ 	bool RefreshMiscTab();
+ 
+ 	bool ShowSAB();
+ 	bool HideSAB();
++	/// CONFIRMED BUG (pimSAB.cxx): guards on main_dlg_sab_handle instead of
++	/// help_dlg_sab_handle -- see class comment and docs/classes/pimCustomDlg.md.
+ 	bool DisableSAB();
++	/// CONFIRMED BUG (pimSAB.cxx): same wrong-handle guard as DisableSAB().
+ 	bool EnableSAB();
+ 	void SetHelpModeSAB(bool tf);
+ };

@@ -1,0 +1,97 @@
+--- a/pim_ui/includes/pimAuthDlg.h
++++ b/pim_ui/includes/pimAuthDlg.h
+@@ -17,34 +17,73 @@
+ #define CREATE_CUST_ACCT "https://www.ptc.com/appserver/common/account/create.jsp?support=y"
+ #define RESET_PWD_LINK "https://www.ptc.com/appserver/common/account/password.jsp"
+ 
++/**
++ * @brief A generic PTC.com account-credential prompt, used whenever a network
++ *        operation against a PTC.com resource returns an authentication
++ *        challenge. Exposed via 2 free functions (pimInitAuthenticationCB()
++ *        for the async browser-security callback path,
++ *        pimNonBrowserAuthenticationCB() for a direct synchronous call) that
++ *        lazily create and reuse a single process-wide instance (AuthDialog).
++ *
++ * The oldest of 3 related dialogs in this codebase (created 2011, vs.
++ * rpimDlg's 2015 and pimFrictionlessTrialDlg's 2018) and confirmed to be the
++ * original template both of those classes were partially copied from -- see
++ * docs/classes/rpimDlg.md and docs/classes/pimFrictionlessTrialDlg.md.
++ * Unlike those 2 (each constructed exactly once per process as a stack-local
++ * object), this class's AuthDialog singleton is confirmed to be REUSED --
++ * Initialize()/Display() called multiple times on the same instance within
++ * one process, via pimSessionInfo::TryAuthorize()'s retry loop and other
++ * confirmed pim_core call paths.
++ *
++ * CONFIRMED STRUCTURAL GAP: Initialize() has no idempotency guard (contrast
++ * with rpimDlg/pimFrictionlessTrialDlg, which both have one) -- exactly the
++ * one class in this family that needed it, given confirmed reuse. Severity
++ * ceiling not fully determined (depends on uiDialog::Initialize()'s own
++ * idempotency, not in this archive). See docs/classes/pimAuthDlg.md Risk
++ * Analysis for full detail, including the confirmed-dead URL member (even
++ * here, in the original template) and GetAuth()'s always-false return value
++ * (called but ignored by every confirmed caller).
++ */
+ class pimAuthDlg : public uiDialog
+ {
+ private:
+ 	// uiObjects
+ 	uiLabel UserNameLabel;
+-	uiInputPanel UserNameInput;	
++	uiInputPanel UserNameInput;
+ 	uiLabel PwLabel;
+-	uiInputPanel PwInput;	
++	uiInputPanel PwInput;
+ 	uiLabel EmailLabel;
+ 	uiPushButton ResetPWButton;
+ 	uiPushButton LoginButton;
+-	uiLabel HelpLabel;	
++	uiLabel HelpLabel;
+ 	uiPushButton AccountButton;
+-	uiLabel AuthRetryLabel;
++	uiLabel AuthRetryLabel;  ///< Populated from RetryMsg in Display() -- confirmed genuinely live, unlike this member's copies on rpimDlg/pimFrictionlessTrialDlg.
+ 
+ public:
+ 	pimAuthDlg();
+ 	~pimAuthDlg();
++	/// CONFIRMED GAP: no `if (initialized) return true;` guard -- every call
++	/// re-invokes uiDialog::Initialize(), yet this class's AuthDialog
++	/// singleton IS confirmed to be re-Initialize()'d across multiple
++	/// authentication challenges in one process -- see class comment.
+ 	bool Initialize();
++	/// Correct pattern (same shape as rpimDlg::Display()): calls
++	/// uiDialog::Activate() unconditionally after setting AuthRetryLabel.
+ 	bool Display();
++	/// CONFIRMED CALLED (2 sites, both in this file) -- unlike its dead
++	/// copies on rpimDlg/pimFrictionlessTrialDlg. But the URL member it sets
++	/// is still never read by anything, even here -- see class comment.
+ 	void SetURL(const wchar_t *);
++	/// CONFIRMED LIVE end-to-end: read by Display() via AuthRetryLabel.SetWLabel(RetryMsg).
+ 	void SetRetryMsg(const wchar_t *);
++	/// Always returns false regardless of actual success; both confirmed
++	/// callers (in this file) ignore the return value entirely.
+ 	bool GetAuth(btkWString &username, btkWString &password);
+-	
++
+ private:
+ 	bool initialized;
+-	btkWString URL, User, Password, RetryMsg;
+-	
++	btkWString URL, User, Password, RetryMsg;  ///< URL is confirmed write-only; RetryMsg is live; User/Password are live.
++
+ protected:
+ 	void Refresh();
+ 	bool OnInputPanelInput(uiInputPanel &);
+@@ -52,7 +91,13 @@
+ 	bool OnClose();
+ };
+ 
++/// Registers pimRequestForUserPwd as the Creo browser-security layer's
++/// authentication pre-action callback (the async integration path).
+ void pimInitAuthenticationCB(pimSessionInfo *S);
++/// The synchronous, direct-call integration path -- confirmed called from
++/// pim_core (pimSessionInfo::TryAuthorize()'s retry loop,
++/// pimGetAvailable::GetSecurity()) as well as pim_ui. Return value IS
++/// checked by every confirmed caller (contrast with GetAuth() above).
+ int pimNonBrowserAuthenticationCB(pimSessionInfo *SessionInfo, const wchar_t *URL, const char *retry_msg = NULL);
+ 
+ 

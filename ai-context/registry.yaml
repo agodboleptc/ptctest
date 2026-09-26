@@ -1,0 +1,74 @@
+# Registry usage catalog. Source of truth: docs/07_registry_usage.md.
+
+registry_mechanisms:
+  - id: xml_declared_generic
+    description: "Product-XML-driven arbitrary key/value creation"
+    implementation: pim_core/pim_core_src/pimRegEditLoop.cxx
+    xml_element: "<REGISTRY>"
+    root_tokens: ["[HKCR]", "[HKLM]", "[HKCU]", "[HKU]"]
+    attributes: {id: subkey_path, valuename: value_name, valuetype: "registry value type (added rev $$5)"}
+    paths_enumerable_from_source: false   # entirely data-dependent at runtime
+    mirrored_to_reg_file: true            # via pimRegFileCreate, for admin redeployment
+    specialized_use: "Creo numbered file-extension / ProgID registration (CreateNumericExtensions)"
+
+  - id: pim_internal_bookkeeping
+    description: "Hardcoded paths compiled into pim_util, not XML-driven"
+    implementation: pim_util/pim_util_src/pimRegisterProduct.cxx
+    mirrored_to_reg_file: false
+
+known_registry_paths:
+  - path: 'HKEY_CURRENT_USER\Software\PTC'
+    value: creoFileVers (REG_DWORD)
+    purpose: "Highest registered numeric Creo file-extension index"
+    mechanism: xml_declared_generic
+    rw: [read: GetHighestCreoFileVer, write: SetHighestCreoFileVer]
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\<UninstallName>'
+    values: [DisplayName, UninstallString, DisplayIcon, URLUpdateInfo, URLInfoAbout, DisplayVersion, VersionMajor, VersionMinor, InstallLocation]
+    purpose: "Standard Windows Add/Remove Programs entry"
+    mechanism: pim_internal_bookkeeping
+    rw: [write: [pimInitializeUninstall, pimWriteLocation, pimWriteVersion, pimAppendValue], read: [pimOpenUninstallKey, pimReadRegValue], delete: pimRemoveUninstallRegKey]
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC\<Name>[\<Release>[\<Datecode>]]'
+    purpose: "Internal PTC install-record bookkeeping, distinct from the Uninstall key"
+    mechanism: pim_internal_bookkeeping
+    rw: [write: pimInitializePTCRecord, read: pimOpenPTCRecord, delete: "pimRemovePTCRecord (recursively prunes empty parents up to and including SOFTWARE\\PTC)"]
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC\PlatformUseLoadpoints\'
+    purpose: "Reference-counts loadpoints depending on the shared Platform utility"
+    mechanism: pim_internal_bookkeeping
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC\QAgentUseLoadpoints\'
+    purpose: "Same reference-counting pattern, for shared Quality Agent utility"
+    mechanism: pim_internal_bookkeeping
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC\PTC Windchill Workgroup Manager\'
+    purpose: "Read-only detection of existing WGM client installs (InstallLocation per subkey)"
+    mechanism: pim_internal_bookkeeping
+    rw: [read_only: pimCheckForWGMInstalls]
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC'
+    purpose: "Base enumeration for 'what PTC software is on this machine'"
+    mechanism: pim_internal_bookkeeping
+    rw: [read_only: [pimGetUtilityList, pimGetProductsInstalled]]
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC\CreoAgent'
+    values: [AgentPackageVersion, "PLATFORM_PACKAGE_VERSION_REG-named value"]
+    purpose: "Prerequisite check: Creo Agent / Platform Services version gate"
+    mechanism: read_only_prerequisite_check
+    used_by_rule: pimCreoTestPlatformAgent
+    doc: docs/05_prerequisite_framework.md
+
+  - path: 'HKEY_LOCAL_MACHINE\SOFTWARE\PTC\Quality Agent\Agent'
+    purpose: "Quality Agent executable path lookup, for cleanup/PHM (not prerequisite gating itself)"
+    mechanism: read_only
+    used_by: pimGetQAgentPathFromReg
+
+rollback_mechanism:
+  implementation: "pimRegEdit::GetInstance().Uninstall(xmlPtr) — process-wide singleton, see ownership.yaml"
+  doc: docs/04_installation_flow.md §7
+
+risks:
+  - "XML-declared mechanism's real-world registry footprint cannot be fully enumerated from source alone (entirely data-dependent)"
+  - "Unrecognized [HKxx] root token in Create() fails silently, no diagnostic"
+  - "pimRemovePTCRecord's recursive delete-if-empty pattern risks deleting a shared parent key on an edge case (not confirmed as an actual bug)"

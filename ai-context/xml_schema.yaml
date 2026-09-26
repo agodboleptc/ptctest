@@ -1,0 +1,71 @@
+# XML document types and vocabulary, reverse-engineered from parsing code.
+# Source of truth: docs/08_xml_configuration.md. Vocabulary source: pim_core/includes/pimDefs.h
+# (~230 pimXxx constants). NO sample XML files exist in this archive — treat structures as
+# reconstructions from read/write call sites, not verified byte-accurate documents.
+
+document_types:
+  - id: product_definition
+    root_element: PRODUCT
+    root_attributes: [name, version, shipcode, arp, parent]
+    consumer: pimEntitlement (pimEntitlement::Init)
+    child_elements:
+      - {name: PROPERTIES, contains: PROPERTY, pattern: '<PROPERTY name="X" attrib="Y">Z</PROPERTY>'}
+      - {name: CDSECTION, attributes: [installed, orig_value], purpose: "one per file-copy/archive payload item"}
+      - {name: DISTRIBUTION, attributes: [from], contains: [MSI, SFX]}
+      - {name: MSI, attributes: [install, upgradecode, version, pf32]}
+      - {name: REGISTRY, attributes: [id, valuename, valuetype], see: registry.yaml}
+      - {name: SHORTCUT, traced: false}
+      - {name: SCRIPT, traced: false}
+      - {name: SERVICE, traced: false}
+      - {name: CUSTOMACTION, attribute_when_values: [PreUpgrade, PreInstall, PreMSIConfigure, PostCopy, PostInstall, PostUpgrade, PreUninstall]}
+      - {name: PREREQUISITE, contains: IS_INSTALLED_FUNC}
+      - {name: IS_INSTALLED_FUNC, attributes: [creoagent_version, creosvcs_version], text_content: "function name string, see business_rules.yaml"}
+      - {name: PSF, traced: false}
+      - {name: PSF_TEMPLATE, traced: false}
+    bracket_properties_example: ["[LP]", "[INSTALLBASE]", "[SOURCE]", "[MEDIAID]", "[THIS_ARCH]", "[THIS_LANG]", "[VERSION]", "[SHIPCODE]", "[ICON]", "[PROGRAMFILES]", "[PROGRAMFILESx86]", "[MSIINSTALLPATH]"]
+
+  - id: image_media_metadata
+    root_element: UNKNOWN
+    consumer: "pim/pim_src/pimTop.cxx (pimInstallerRun)"
+    child_elements:
+      - {name: FAMILY, attributes: [name]}
+      - {name: ENTITLEMENT}
+      - {name: PTCSETUP, alt_name: PIMSETUP, attributes: [shipcode, version]}
+    text_nodes_read: [SHIPCODE, DATECODE, LABEL, BANNER_NAME, BANNER_VER, PLATFORM]
+
+  - id: session_state
+    consumer: pimSessionInfo
+    pattern: "same generic PROPERTY mechanism as product_definition"
+    property_key_catalog_location: "pim_core/includes/pimSessionInfo.h #define block (~30 keys)"
+
+  - id: download_url_references
+    consumer: "pimEntitlement::UpdateUrls / UpdateMediaUrls"
+    elements: [url, filesize]
+    relationship: "each url's trailing filename (root+query stripped) matched against a CDSECTION's orig_value attribute or text content"
+
+  - id: translation_files
+    consumer: pimTranslateMgr (fully traced, see docs/classes/pimTranslateMgr.md)
+    structure: "<TRANSLATION file? element attribute attributeMatch modify?><TEXT>localized value</TEXT></TRANSLATION> -- file/element/attribute/attributeMatch/modify are all XML attributes on <TRANSLATION>; file and modify are optional (file absent = applies to every product; modify absent = overwrites the matched node's text content instead of a named attribute)"
+
+  - id: web_service_licensing_messages
+    consumer: ["pimGetMediaDetails", "pimPTCDotCom", "pim_ui's pimPTCLicenseGet/pimPTCRenewLicenseGet/pimFrictionlessTrialLicenseGet"]
+    style: SOAP_like
+    namespaces:
+      - {name: pimNSsoapenv, uri: "http://schemas.xmlsoap.org/soap/envelope/"}
+      - {name: pimNSlic, uri: "https://apps.ptc.com/appserver/LicenseService"}
+      - {name: pimNSweb, uri: "http://webService.lm.ptc.com/"}
+      - {name: pimNSser, uri: "http://service.lm.ptc.com/"}
+      - {name: pimNSmedia, uri: "https://apps.ptc.com/external/PtcMediaService"}
+    message_elements: [LicenseRequestMsg, LicenseRequestResponseMsg, LicenseFileRequestMsg, LicenseFileRequestResponseMsg, AuthenticationRequestMsg, AuthenticationResponse, MediaRequestMsg, MediaRequestResponseMsg, AddonLicenseFileRequest, AddonRequest, GetAvailableProductsResponseMsg, TransactionCompleteRequestMsg]
+    field_elements_examples: [requestId, responseCode, responseMessage, errorCode, errorMessage, hostid, seatcount, licensefile, apikey, scn, authid, userid, username, userpwd]
+    relationship_to_local_xml: "functionally independent — client-of-PTC's-web-services traffic, not local install configuration"
+
+validation:
+  schema_support_exists: true
+  mechanism: "pimXmlFile::UseSchema()/SetSchema(xsd), XercesDOMParser::ValSchemes"
+  actual_schema_file_present_in_archive: false
+  confirmed_actually_invoked: UNKNOWN
+  closest_real_validation: "root-element name matching in Init(file, root_match, ...); silent tolerance of missing elements/attributes elsewhere (if (map) {...} guards)"
+
+vocabulary_source_file: pim_core/includes/pimDefs.h
+vocabulary_constant_count_approx: 230

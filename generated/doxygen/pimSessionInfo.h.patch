@@ -1,0 +1,633 @@
+--- a/pim_core/includes/pimSessionInfo.h
++++ b/pim_core/includes/pimSessionInfo.h
+@@ -8,7 +8,7 @@
+   12-Dec-11 P-10-14   TWH   $$4    Update for Beta build
+   09-Jan-12 P-10-15   TWH   $$5    Add HasLicenseIdx
+   23-Jan-12 P-10-16   TWH   $$6    Add AddEntitlement overloaded function
+-  13-Feb-12 P-10-17   TWH   $$7    Add FILE_NEEDS_SERVER 
++  13-Feb-12 P-10-17   TWH   $$7    Add FILE_NEEDS_SERVER
+   15-Feb-12 P-10-17   TWH   $$8    Modify init default commands
+   07-Mar-12 P-10-17   TWH   $$9    FCS bug fix
+   06-Apr-12 P-20-03   TWH   $$10   Add Property defines
+@@ -19,7 +19,7 @@
+   05-Feb-13 P-20-23   TWH   $$15   Add SERVER_FILE_NOT_THIS_HOST; export_status
+   11-Mar-13 P-20-25   TWH   $$16   Add LICENSED_PROPERTY
+   06-May-13 P-20-29   TWH   $$17   Add ModifyLicenseSource
+-  08-Nov-13 P-20-42   SGL   $$18   corrected the fix added for SPR#2195322 
++  08-Nov-13 P-20-42   SGL   $$18   corrected the fix added for SPR#2195322
+   18-Jun-14 P-20-55   MTH   $$19   upgrade property and member functions addded.
+   30-Sep-14 P-20-61   AGO   $$20   school edition specific changes
+   29-Sep-15 P-30-17   MTH   $$21   renewlicense mode added
+@@ -52,6 +52,13 @@
+ // on the SiteURL
+ //
+ 
++/**
++ * Remembered browser/network credentials for one site URL, used to answer
++ * repeated authentication challenges without re-prompting the user.
++ *
++ * Dependencies:
++ * - btkWString (external btk).
++ */
+ class pimSecurity
+ {
+ private:
+@@ -60,6 +67,14 @@
+ 	pimSecurity(){}
+ 	~pimSecurity(){}
+ 
++	/**
++	 * Stores (or updates, for any non-null argument) the credentials for a site.
++	 *
++	 * @param url Site URL; ignored (left unchanged) if NULL.
++	 * @param name Username; ignored (left unchanged) if NULL.
++	 * @param passwd Password; ignored (left unchanged) if NULL.
++	 * @return void
++	 */
+ 	void setSecurity(const wchar_t *url,const wchar_t *name,const wchar_t *passwd)
+ 	{
+ 		if (url) Url = url;
+@@ -67,12 +82,20 @@
+ 		if (passwd) Passwd = passwd;
+ 	}
+ 
++	/**
++	 * @param name Receives the stored username.
++	 * @param passwd Receives the stored password.
++	 * @return void
++	 */
+ 	void getSecurity(btkWString &name, btkWString &passwd)
+ 	{
+ 		name = (const wchar_t *)Name;
+ 		passwd = (const wchar_t *)Passwd;
+ 	}
+ 
++	/**
++	 * @return The site URL this credential entry is keyed on.
++	 */
+ 	inline operator const btkWString &() const
+ 	{
+ 		return (Url);
+@@ -83,6 +106,37 @@
+ class pimPTCRenewLicenseGet;
+ class pimFrictionlessTrialLicenseGet;
+ class pimEntitlement;
++/**
++ * Top-level session state for one run of PIM: the collection of candidate
++ * and already-installed products (pimEntitlement instances), license
++ * source/security state, and a generic string-keyed property bag used as
++ * the application's de facto configuration/context blackboard.
++ *
++ * Responsibilities:
++ * - Own EntitlementArray (candidates for this session) and InstalledArray
++ *   (already-installed products).
++ * - Own xmlWhatsInstalled (pimInterrogator) for machine-state discovery.
++ * - Own the license-source workflow: add/modify/drop/validate license
++ *   sources, detect triads, and track firewall exceptions.
++ * - Own the generic property bag (SetProperty/GetProperty), backed by an
++ *   internal pimXmlFile rather than a simple in-memory map.
++ * - Persist/restore session state across process runs (Save(),
++ *   FoundPreviousSessionInfoFile(), LoadPreviousSessionInfoFile()).
++ * - Coordinate trial/school/beta license acquisition.
++ *
++ * Dependencies:
++ * - pimXmlFile (session XML document backing the property bag).
++ * - pimInterrogator (installed-product/license-source discovery).
++ * - pimLicenseSource (license validation logic).
++ * - pimEntitlement (owns arrays of these; forward-declared here).
++ *
++ * Thread safety: guarded by a thrRWLock* (Mutex), implying the design
++ * intent is many concurrent readers (e.g. UI polling while
++ * StartValidateThread()'s background thread runs) with exclusive writers.
++ *
++ * Lifetime: one instance per process run, stack-allocated in each pim*Run
++ * function in pim/pim_src/pimTop.cxx.
++ */
+ class pimSessionInfo
+ {
+ private:
+@@ -110,51 +164,219 @@
+ public:
+ 	pimSessionInfo();
+ 	~pimSessionInfo();
++	/**
++	 * @param ent Entitlement to check, or NULL to check whether any known entitlement is a license-server entitlement.
++	 * @return true if the given (or any) entitlement represents a license server product.
++	 */
+ 	bool IsLicenseServerEntitlement(pimEntitlement* ent = NULL);
++	/**
++	 * @param tf New value for the "is update" session flag.
++	 * @return void
++	 */
+ 	void SetIsUpdateValue(bool);
++	/**
++	 * @return true if this session represents an update of an existing install.
++	 */
+ 	bool GetIsUpdateValue();
++	/**
++	 * @param mode New install-mode string.
++	 * @return void
++	 */
+ 	void SetInstallMode(btkString mode);
++	/**
++	 * @return The current install-mode string.
++	 */
+ 	btkString GetInstallMode();
++	/**
++	 * @param tf New value for the "is group uninstall" session flag.
++	 * @return void
++	 */
+ 	void SetIsGroupUninstallValue(bool);
++	/**
++	 * @return true if this session represents a group uninstall.
++	 */
+ 	bool GetIsGroupUninstallValue();
++	/**
++	 * Sets a named property in the session's property bag (backed by xmlPtr).
++	 *
++	 * @param name Property key.
++	 * @param value Property value.
++	 * @param attrib When non-null, stores value as this XML attribute instead of element text.
++	 * @return true on success.
++	 */
+ 	bool SetProperty(const char *name, const char *value, const char *attrib = NULL);
++	/**
++	 * Reads a named property from the session's property bag.
++	 *
++	 * @param name Property key.
++	 * @param value Receives the property value.
++	 * @param attrib When non-null, reads this XML attribute instead of element text.
++	 * @return true if the property was found.
++	 */
+ 	bool GetProperty(const char *name, btkString &value, const char *attrib = NULL);
++	/**
++	 * @param xmlPath Receives the path to the installed license-server XML, if any.
++	 * @param xmlTag Receives the associated XML tag.
++	 * @return true if an installed license-server XML was found.
++	 */
+ 	bool GetInstalledLicenseServerXml(btkFSEntry& xmlPath, btkString& xmlTag);
++	/**
++	 * @param tf New EULA-accepted state.
++	 * @return true on success.
++	 */
+ 	bool SetEULA(bool);
++	/**
++	 * @return true if the EULA has been accepted this session.
++	 */
+ 	bool GetEULA();
+-	
++
++	/**
++	 * Records credentials for a site URL (see pimSecurity).
++	 *
++	 * @param url Site URL.
++	 * @param name Username.
++	 * @param passwd Password.
++	 * @return true on success.
++	 */
+ 	bool SetSecurity(const wchar_t *url, const wchar_t *name, const wchar_t *passwd);
++	/**
++	 * Retrieves previously-recorded credentials for a site URL.
++	 *
++	 * @param url Site URL.
++	 * @param name Receives the username.
++	 * @param passwd Receives the password.
++	 * @return true if credentials were found for this URL.
++	 */
+ 	bool GetSecurity(const wchar_t *url, btkWString &name, btkWString &passwd);
++	/**
++	 * @param url Site URL whose credentials should be forgotten.
++	 * @return true if an entry was found and removed.
++	 */
+ 	bool DelSecurity(const wchar_t *url);
++	/**
++	 * @return The session's pimInterrogator instance (installed-software/license-source discovery).
++	 */
+ 	pimInterrogator *GetInterrogator();
+-	
++
++	/**
++	 * Recomputes license-source status using the given property converter.
++	 *
++	 * @param Converter Converter used to resolve XML property placeholders.
++	 * @return void
++	 */
+ 	void SetLicenseSourceStatus(pimConvert* Converter);
++	/**
++	 * @param status Receives the current license-source status string.
++	 * @param name Receives the associated license source name.
++	 * @return true if a status was available.
++	 */
+ 	bool GetLicenseSourceStatus(btkString& status, btkString& name);
+ 	// expects xml file with root node PRODUCT
+ 	// anything else should fail
++	/**
++	 * Parses the given product-definition XML file and registers a new
++	 * pimEntitlement in EntitlementArray if it is a valid PRODUCT document.
++	 *
++	 * @param xmlFilePath Path to the product-definition XML.
++	 * @return true if the file was a valid product definition and an entitlement was added.
++	 */
+ 	bool AddEntitlement(cStringT);
++	/**
++	 * Registers a new pimEntitlement from already-parsed application/URL XML documents.
++	 *
++	 * @param xml The application/product-definition document.
++	 * @param urls The associated download-URL document.
++	 * @param MediaID Media identifier this entitlement is associated with.
++	 * @return true on success.
++	 */
+ 	bool AddEntitlement(pimXmlFile *xml, pimXmlFile *urls, const btkString &);
++	/**
++	 * @return The number of entries in EntitlementArray.
++	 */
+ 	int GetEntitlementSize();
++	/**
++	 * @param id Entitlement ID to look up.
++	 * @return The matching pimEntitlement, or NULL if not found.
++	 */
+ 	pimEntitlement *GetEntitlement(cStringT);
++	/**
++	 * @param index Index into EntitlementArray.
++	 * @return The pimEntitlement at that index, or NULL if out of range.
++	 */
+ 	pimEntitlement *GetEntitlement(int);
++	/**
++	 * @param id Entitlement ID to remove.
++	 * @return true if found and removed.
++	 */
+ 	bool DropEntitlement(cStringT);
++	/**
++	 * @param index Index into EntitlementArray to remove.
++	 * @return true if valid and removed.
++	 */
+ 	bool DropEntitlement(int);
++	/**
++	 * @param port Receives the default license port value.
++	 * @param eport Receives the default encrypted/alternate license port value.
++	 * @return true on success.
++	 */
+ 	bool GetDefaultPortValues(btkString& port, btkString& eport);
++	/**
++	 * @return The entitlement representing the license server product, if any.
++	 */
+ 	pimEntitlement* GetLicenseServerEntitlement();
+ 	// Installed
++	/**
++	 * @param id Installed-product entitlement ID.
++	 * @return true if added to InstalledArray.
++	 */
+ 	bool AddInstalledEntitlement(cStringT);
++	/**
++	 * @return The number of entries in InstalledArray.
++	 */
+ 	int GetInstalledEntitlementSize();
++	/**
++	 * @param id Installed entitlement ID to look up.
++	 * @return The matching pimEntitlement from InstalledArray, or NULL if not found.
++	 */
+ 	pimEntitlement *GetInstalledEntitlement(cStringT);
++	/**
++	 * @param index Index into InstalledArray.
++	 * @return The pimEntitlement at that index, or NULL if out of range.
++	 */
+ 	pimEntitlement *GetInstalledEntitlement(int);
++	/**
++	 * @param id Installed entitlement ID to remove.
++	 * @return true if found and removed.
++	 */
+ 	bool DropInstalledEntitlement(cStringT);
++	/**
++	 * @param index Index into InstalledArray to remove.
++	 * @return true if valid and removed.
++	 */
+ 	bool DropInstalledEntitlement(int);
++	/**
++	 * @param out Receives the path to the installed license file, if any.
++	 * @return true if found.
++	 */
+ 	bool pimGetInstalledLicenseFilePath(btkFSEntry&);
++	/**
++	 * @param warning Receives the current firewall exception warning text.
++	 * @return true if a warning is present.
++	 */
+ 	bool GetFirewallExceptionWarning(btkString &warning);
++	/**
++	 * Recomputes FirewallExceptionWarning by checking the local firewall state.
++	 * @return void
++	 */
+ 	void ValidateFirewallStatus();
+ 	// expected inputs:
+ 	// 7788@host
+ 	// c:\myserver\node_locked.dat
+ 	//
++	/**
++	 * Classifies the validity/state of a license source (a "port@host"
++	 * string or a node-locked license file path).
++	 */
+ 	enum LicenseStatus {
+ 		UNKNOWN,                      // when someone starts typing in something
+ 		ATTEMPTING_VALIDATION,        // we know what to check; just a matter of time
+@@ -164,62 +386,240 @@
+ 		LOCKED_FILE_NOT_THIS_HOST,    // File that is licensed for another host
+ 		SERVER_FILE_NOT_THIS_HOST,    // File that is licensed for another host
+ 		VALID_LICENSE_FILE,            // file that is FLEX and has a SERVER line for this host - good
+-		VALID_LICENSE_SERVER,         // Valid license server - good 
++		VALID_LICENSE_SERVER,         // Valid license server - good
+ 		VALID_LOCKED_FILE,            // good
+ 		VALID_TRIAD,                  // good
+ 		NOT_SUITABLE,                 // mismatch in type
+ 		FILE_EXPIRED,                  // File is expired
+ 		TRIAD_TO_SINGLE_CONFLICT       // triad and single license conflict
+ 	};
++	/**
++	 * @param lic_src_status Status value to translate.
++	 * @param str Receives the localized, human-readable message for that status.
++	 * @return void
++	 */
+ 	void GetStatusTranslateMsg(pimSessionInfo::LicenseStatus lic_src_status, btkString& str);
++	/**
++	 * @param index Row index for this license source in the UI.
++	 * @param cStringT The license source string ("port@host" or a file path).
++	 * @param is_user_typed Whether the user typed this value directly (vs. auto-discovered).
++	 * @return true on success.
++	 */
+ 	bool AddLicenseSource(int index, cStringT, bool is_user_typed = false);
++	/**
++	 * @param index Row index for this license source.
++	 * @param cStringT The license source string.
++	 * @return true on success.
++	 */
+ 	bool AddLicenseSourceNew(int index, cStringT);
++	/**
++	 * @param cStringT The license source string to check.
++	 * @return true if already present in the session's license-source list.
++	 */
+ 	bool IsLicenseSourceAlreadyAdded(cStringT);
++	/**
++	 * @param index Row index to modify.
++	 * @param cStringT New license source value for that row.
++	 * @return true on success.
++	 */
+ 	bool ModifyLicenseSource(int index, cStringT);
++	/**
++	 * @param idx Row index to check.
++	 * @return true if a license source is registered at that index.
++	 */
+ 	bool HasLicenseIndex(int idx);
++	/**
++	 * @param X License source string to check.
++	 * @return true if X is already known to this session.
++	 */
+ 	bool HasLicense(cStringT X); // check if we already know about license source X
++	/**
++	 * @param out Receives the current number of registered license sources.
++	 * @return true on success.
++	 */
+ 	bool GetSizeLicenseSources(int &);
++	/**
++	 * @param out Receives the next available row index for a new license source.
++	 * @return true on success.
++	 */
+ 	bool GetNewLicenseSourceIndex(int &);
++	/**
++	 * @param idx Row index to look up.
++	 * @param out Receives the license source string.
++	 * @param source_status Receives the validation status for this source.
++	 * @param allow_incomplete When true, returns partially-typed/unvalidated sources too.
++	 * @return true if a source was found at idx.
++	 */
+ 	bool GetLicenseSourceByIdx(int idx, btkString &out, LicenseStatus &source_status, bool allow_incomplete = false);
++	/**
++	 * @param idx Row index to remove.
++	 * @return true if found and removed.
++	 */
+ 	bool DelLicenseSourceByIdx(int idx);
++	/**
++	 * @param X License source string to reset validation state for.
++	 * @return true on success.
++	 */
+ 	bool ResetLicenseSource(cStringT X);
+ 
++	/**
++	 * @param cStringT License prefix to check.
++	 * @return true if this session's license sources can satisfy the given prefix.
++	 */
+ 	bool CanLicensePrefixes(cStringT);
++	/**
++	 * @param out Receives the combined set of all discovered license features across all sources.
++	 * @return true on success.
++	 */
+ 	bool GetAllLicenseFeatures(btkString &out);
+ 
+ 	// call to setup the PSF entries in the entitlement xml
+ 	// with the entered LicenseSources + found LTR features
+ 	// from those sources.  ie the default license setup
++	/**
++	 * Writes the session's entered license sources and discovered LTR
++	 * features into the given (or every) entitlement's PSF-related XML
++	 * entries -- the default license setup.
++	 *
++	 * @param App Entitlement to initialize, or NULL to apply to all entitlements.
++	 * @return true on success.
++	 */
+ 	bool InitDefaultCommands(pimEntitlement *App = NULL);
++	/**
++	 * @param out Receives the default install loadpoint directory.
++	 * @return void
++	 */
+ 	void GetDefaultLoadpoint(btkFSEntry &);
+ 
++	/**
++	 * @return true if ptc.com/PTC IT communication succeeded.
++	 */
+ 	bool TestCommunicationToPTC();
++	/**
++	 * @return true if a previous session-info save file was found on disk.
++	 */
+ 	bool FoundPreviousSessionInfoFile();
++	/**
++	 * Loads state from the previously-found session-info file.
++	 * @return true on success.
++	 */
+ 	bool LoadPreviousSessionInfoFile();
+ 
++	/**
++	 * A do/while retry loop (pim_core_src/pimSessionInfo.cxx:1911-1984, fully
++	 * traced in a further, dedicated pass): while GetSecurity(url) (the
++	 * production URL) finds no cached credentials, or the previous
++	 * pimAuthorizeToPTC() attempt was rejected by the server, shows the
++	 * PTC.com login dialog via pimNonBrowserAuthenticationCB()
++	 * (pim_ui/pim_ui_src/pimAuthDlg.cxx:87-112) and calls
++	 * pimAuthorizeToPTC() (pim_core_src/pimPTCDotCom.cxx:540-679) again.
++	 * Called from GetTrialLicense()/GetSchoolLicense()/GetBetaLicense()
++	 * (:2003,2129,2184), reached from
++	 * pimInstallMgrDlg::OnPushButtonActivate(NextStepBtn) via
++	 * EulaNextPreAction()/BetaEulaNextPreAction() -- see
++	 * docs/classes/pimInstallMgrDlg.md's Risk Analysis for a confirmed bug
++	 * in that caller's own EULA-decline ordering.
++	 *
++	 * CONFIRMED BUG, HIGH SEVERITY: loops FOREVER, with no user prompt and
++	 * no retry cap, whenever pimAuthorizeToPTC() fails on a transport/parse
++	 * error (network unreachable, unparseable response) -- there is no
++	 * `else` for that outcome, so do_continue stays true and the cached
++	 * credentials are left untouched, making the next GetSecurity(url) call
++	 * succeed and immediately retry the identical, still-failing call.
++	 * Contrast pimGetAvailable::SearchForAvailableDownloads()
++	 * (pim_core_src/pimGetAvailable.cxx:114-136), which returns -3 on the
++	 * identical pimAuthorizeToPTC() failure and lets its caller abort.
++	 *
++	 * CONFIRMED BUG: a pimXmlFile is leaked on every rejected-credentials
++	 * retry (and every pass of the infinite loop above) --
++	 * pimAuthorizeToPTC(..., &out) (pimPTCDotCom.cxx:651) unconditionally
++	 * overwrites *out without deleting the previous allocation.
++	 *
++	 * CONFIRMED credential-key aliasing with pimGetAvailable::GetSecurity()
++	 * -- see docs/classes/pimSessionInfo.md's Risk Analysis for the full
++	 * trace, the static `out` pointer's confirmed lack of purpose, and a
++	 * confirmed dead #if 0 duplicate of this call inside GetTrialLicense()
++	 * that would not compile if re-enabled.
++	 *
++	 * @return true if authorization against PTC succeeded. false ONLY ever
++	 * means the user cancelled the credential dialog -- a genuine
++	 * authorization failure is not a possible return value; see the
++	 * infinite-loop bug above.
++	 */
+ 	bool TryAuthorize();
++	/**
++	 * @return true if a trial license was successfully obtained.
++	 */
+ 	bool GetTrialLicense();
++	/**
++	 * @return The pimPTCLicenseGet loop object driving the trial-license fetch.
++	 */
+ 	pimPTCLicenseGet *GetTrialLicenseLoop();
++	/**
++	 * @return true if a school-edition license was successfully obtained.
++	 */
+ 	bool GetSchoolLicense();
++	/**
++	 * @return The pimPTCLicenseGet loop object driving the school-license fetch.
++	 */
+ 	pimPTCLicenseGet *GetSchoolLicenseLoop();
++	/**
++	 * @return true if a beta license was successfully obtained.
++	 */
+ 	bool GetBetaLicense();
++	/**
++	 * @return The pimPTCLicenseGet loop object driving the beta-license fetch.
++	 */
+ 	pimPTCLicenseGet *GetBetaLicenseLoop();
+ 
++	/**
++	 * Persists the current session state to disk.
++	 * @return void
++	 */
+ 	void Save();
+ 
++	/**
++	 * Performs end-of-run cleanup so the hosting EXE can safely unload the pim DLL.
++	 * @return void
++	 */
+ 	void PrepareForShutdown();
+ 
+ 	// utility for UI usage
++	/**
++	 * @param reset When true, restarts the processing-label sequence from the beginning.
++	 * @return The next human-readable "currently processing" label for UI display.
++	 */
+ 	cStringT GetNextProcessingLabel(bool reset);
+ 
+ 	// don't call unless you want to remove the xml files from [APPLICATIONDATA]/pim
++	/**
++	 * Deletes the session's temporary saved XML files under [APPLICATIONDATA]/pim.
++	 * @return void
++	 */
+ 	void ClearTempSaveFiles();
+ 
++	/**
++	 * @return The session's underlying pimXmlFile (property-bag document).
++	 */
+ 	pimXmlFile *GetXMLPtr(){ return xmlPtr; }
++	/**
++	 * Starts a background thread that validates all registered license sources concurrently with UI interaction.
++	 * @return void
++	 */
+ 	void StartValidateThread();
+ 
++	/**
++	 * Populates the session's OLDSHIPCODE_PROPERTY from the previously-installed shipcode, if any.
++	 * @return void
++	 */
+ 	void GetOldShipCode();
++	/**
++	 * @return true if the local firewall allows the PTC.D process.
++	 */
+ 	bool pimIsPTCDProcessAllowedInFirewall();
++	/**
++	 * @return true if the local firewall allows the lmgrd process.
++	 */
+ 	bool pimIsLmgrdProcessAllowedInFirewall();
+ 
+ 
+@@ -232,12 +632,17 @@
+ 
+ // Properties
+ 
++/** Session property key: existing FLEX server address, if one was detected on the host. */
+ #define EXISTING_FLEX_SERVER_PROPERTY "EXISTING_FLEX"
++/** Session property key: install location of the existing FLEX server detected above. */
+ #define EXISTING_FLEX_LOCATION_PROPERTY "EXISTING_FLEX_LOCATION"
+ 
++/** Session property key: path to a node-locked license file for renew-license mode. */
+ #define NODE_LOCKED_LICENSE_PATH_PROPERRTY "NODE_LOCKED_LICENSE_PATH"
+ 
++/** Session property key: license identifier ("SON"). */
+ #define LICENSE_IDENTIFER_PROPERTY "SON"
++/** Session property key: current OS username. */
+ #define USERNAME_PROPERTY "USERNAME"
+ #define HOST1_PROPERTY "HOST1"
+ #define HOSTID1_PROPERTY "CPUID1"
+@@ -251,29 +656,42 @@
+ #define FLEX_LOCALHOST_PROPERTY "LOCAL_FLEX"
+ #define FLEX_LOCALHOSTID_PROPERTY "LOCAL_FLEX_ID"
+ #define FLEX_LOCALPORT_PROPERTY "LOCAL_FLEX_PORT"
++/** Session property key: trial "-optnum" value passed on the pim_rl.exe command line. */
+ #define TRIAL_OPTNUM "TRIAL_OPTNUM"
+ 
++/** Session property key: this machine's platform/architecture string. */
+ #define PLATFORM_PROPERTY "[THIS_ARCH]"
++/** Session property key: UI language directory in use. */
+ #define LANGUAGE_PROPERTY "[THIS_LANG]"
++/** Session property key: current product shipcode. */
+ #define SHIPCODE_PROPERTY "[SHIPCODE]"
++/** Session property key: shipcode of the product being updated from. */
+ #define OLDSHIPCODE_PROPERTY "[OLDSHIPCODE]"
++/** Session property key: current product version. */
+ #define VERSION_PROPERTY "[VERSION]"
+ #define OLDVERSION_PROPERTY "[OLDSHIPCODE]"
++/** Session property key: image datecode. */
+ #define DATECODE_PROPERTY "[DATECODE]"
+ #define CDLABEL_PROPERTY  "DVD_CD_LABEL"
+ #define CDIMAGE_PROPERTY  "DVD_CD_IMAGE"
+ 
++/** Session property key: set when PTC.com/network communication is unavailable. */
+ #define NO_PTCDOTCOM_PROPERTY "NETWORK_COMMS"
++/** Session property key: locally installed msi.dll version string. */
+ #define MSIVERSION_PROPERTY "localhost.msi.version"
+ 
++/** Session property key: "Y"/"N" -- whether this is a physical-media (vs. network) install. */
+ #define MEDIA_PROPERTY "PHYSICAL_MEDIA"
++/** Session property key: path to the running setup executable (argv[0]). */
+ #define EXERUN_PROPERTY "SETUP_EXE"
+ 
+ #define INSTALLMODE_PROPERTY "installmode"
+ #define EULA_PROPERTY "eula_status"
+ #define EULA_EXPORT_PROPERTY "export_status"
++/** Session property key: "Y"/"N" -- whether licensing has been completed. */
+ #define LICENSED_PROPERTY "licensed_status"
+ 
++/** Session property key: base install path ([INSTALLBASE]) resolved from the product XML. */
+ #define INSTALLWHERE_PROPERTY "[INSTALLBASE]"
+ 
+ #define INITDEFAULTCOMMANDS_PROPERTY "InitDefaultCommands"

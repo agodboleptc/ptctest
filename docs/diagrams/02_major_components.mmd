@@ -1,0 +1,97 @@
+%% Major Components (from docs/02_architecture_overview.md §2)
+%% Source: docs/02_architecture_overview.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+graph TD
+    subgraph "pim (DLL, exported entry points)"
+        Top["pimTop.cxx\npimInstallerRun / pimFrictionlessTrialRun / pimRenewLicenseRun"]
+    end
+
+    subgraph "pim_ui (dialogs)"
+        InstallDlg[pimInstallMgrDlg]
+        FrictionlessDlg[pimFrictionlessTrialDlg]
+        RenewDlg[rpimDlg]
+        CustomDlg[pimCustomDlg]
+    end
+
+    subgraph "pim_core (engine & state)"
+        SessionInfo[pimSessionInfo]
+        Interrogator[pimInterrogator]
+        Entitlement[pimEntitlement]
+        Loop[pimLoop - base class]
+        CopyLoop[pimCopyLoop]
+        MSILoop[pimMSILoop]
+        SFXLoop[pimSFXLoop]
+        ScriptLoop[pimScriptLoop]
+        ShortcutLoop[pimShortcutLoop]
+        RegEditLoop[pimRegEditLoop]
+        ServiceLoop[pimServiceLoop]
+        PsfLoop[pimPsfLoop]
+        DownloadLoop[pimDownloadLoop]
+        XmlFile[pimXmlFile]
+        PackageMgr[pimPackageMgr]
+        PlatformMgr[pimPlatformMgr]
+        LanguageMgr[pimLanguageMgr]
+        Prerequisite[Prerequisite graph\nwithin pimEntitlement]
+        Log[pimLog / pimMessage]
+    end
+
+    subgraph "pim_util (OS/platform utilities)"
+        Cab[pimCab / pimFdi32]
+        MSIUtil[pimMSI]
+        FlexNet[pimFLEXnet]
+        RegisterProduct[pimRegisterProduct]
+        Scramble[pimScramble]
+        Windows[pimWindows]
+    end
+
+    subgraph "External / EXTERNAL-UNKNOWN"
+        BTK["btk toolkit\n(btkString, btkFSEntry, thrThread, btkUnzip/libzip, ui* dialog classes)"]
+        Xerces[Xerces-C DOM]
+        Win32[Win32 API / Registry]
+        MSIPlat[Windows Installer]
+        FDI[Windows Cabinet FDI]
+        PTCPlatform["Other PTC platform DLL(s)\n(imp_pim_dll.h imports)"]
+    end
+
+    Top --> SessionInfo
+    Top --> InstallDlg
+    Top --> FrictionlessDlg
+    Top --> RenewDlg
+    Top --> XmlFile
+
+    SessionInfo --> Interrogator
+    SessionInfo --> Entitlement
+
+    Entitlement --> Loop
+    Entitlement --> Prerequisite
+    Entitlement -->|via pimCopier| CopyLoop
+    Entitlement -->|via pimMSICopier| MSILoop
+    Entitlement -->|via pimSFXCopier| SFXLoop
+    Entitlement -->|via pimShortcuts| ShortcutLoop
+    Entitlement -->|via pimRegEdit wrapper| RegEditLoop
+    Entitlement -->|via pimServices| ServiceLoop
+    Entitlement -->|via pimDownloader| DownloadLoop
+    Entitlement -->|direct, ad hoc| ScriptLoop
+    Entitlement -->|direct, ad hoc| PsfLoop
+    Entitlement --> XmlFile
+
+    Loop --> BTK
+
+    InstallDlg --> SessionInfo
+    InstallDlg --> PackageMgr
+    InstallDlg --> PlatformMgr
+    InstallDlg --> LanguageMgr
+    CustomDlg --> PackageMgr
+
+    CopyLoop --> Cab
+    MSILoop --> MSIUtil
+    FlexNet --> Interrogator
+
+    XmlFile --> Xerces
+    RegEditLoop --> Win32
+    MSIUtil --> MSIPlat
+    Cab --> FDI
+
+    Top --> PTCPlatform
+    Log --> BTK

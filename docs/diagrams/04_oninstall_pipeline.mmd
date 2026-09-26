@@ -1,0 +1,66 @@
+%% pimEntitlement::OnInstall Pipeline (from docs/04_installation_flow.md §2)
+%% Source: docs/04_installation_flow.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+sequenceDiagram
+    participant Ent as pimEntitlement::OnInstall
+    participant Copier as pimCopier (owns pimCopyLoop)
+    participant MSI as InstallMSI()
+    participant Reg as pimRegEdit (singleton, owns pimRegEditLoop)
+    participant Scripts as pimScriptLoop (transient)
+    participant Svc as pimServices (owns pimServiceLoop)
+    participant Psf as pimPsfLoop (transient)
+    participant Shortcuts as pimShortcuts (owns pimShortcutLoop)
+
+    Note over Ent: SetupConverter(Converter, xmlPtr)
+    opt UpdateOfProduct != NULL (this install supersedes an existing one)
+        Ent->>Ent: OnInstallCustomActions("PreUpgrade", true)
+        Ent->>Ent: remove previous uninstall registry entry (pimRemoveUninstallRegKey)
+        Ent->>Ent: remove previous PTC install record (pimRemovePTCRecord)
+        Ent->>Ent: UpdateOfProduct->UninstallShortcuts()
+        Ent->>Ent: UpdateOfProduct->UninstallService()
+        Note over Ent: CommonFiles-still-needed check via a fresh pimInterrogator (only outside FlexOnly/WGM modes)
+    end
+    Ent->>Ent: OnInstallCustomActions("PreInstall", true)
+    Note over Ent: cancel checks + (untraced-in-depth) prerequisite/disk-space validation, ~lines 5940-6240
+    alt no MSI/EngNotebook component, or NoPreCopyMSI set (pre-copy path)
+        Ent->>Copier: StartCopy()
+    end
+    Note over Ent: create Add/Remove Programs uninstall entry (pimInitializeUninstall, pimWriteLocation, pimWriteVersion -- direct registry writes, not via pimRegEditLoop)
+    opt HasMSIInstall() || HasEngNotebookInstall()
+        Ent->>Ent: OnInstallCustomActions("PreMSIConfigure")
+    end
+    alt HasMSI/EngNotebook, !NoPreCopyMSI, (update-or-new), run_msi
+        Ent->>MSI: InstallMSI()  %% pre-copy MSI install
+    end
+    opt !NoCopyStep
+        alt not already started above
+            Ent->>Copier: StartCopy()
+        end
+        Ent->>Copier: WaitForCopyToComplete()
+    end
+    alt HasMSI/EngNotebook, !NoPostCopyMSI, (update-or-new)
+        Ent->>MSI: InstallMSI()  %% post-copy MSI install
+    end
+    Ent->>Ent: OnInstallCustomActions("PostCopy", true)
+    opt !NoRegistryActions
+        Ent->>Reg: ApplyRegistryChanges()
+    end
+    opt !NoScripts
+        Ent->>Scripts: InstallScripts()
+    end
+    opt !NoServices
+        Ent->>Svc: PerformServiceAction()
+    end
+    opt !NoPSF
+        Ent->>Psf: InstallPSF()
+    end
+    opt !NoShortcuts && !pimGetCreoNGCRIMode()
+        Ent->>Shortcuts: InstallShortcuts()
+    end
+    Ent->>Ent: cancel check (see Error Paths)
+    Ent->>Ent: OnInstallCustomActions("PostInstall", false, false)
+    opt UpdateOfProduct != NULL
+        Ent->>Ent: OnInstallCustomActions("PostUpgrade", false, false)
+    end
+    Note over Ent: total_pct_done=100; status = Complete / CompleteWithWarnings / CompleteWithErrors (from CA_WARNINGS[_WITH_ERROR] properties)

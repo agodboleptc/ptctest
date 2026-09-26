@@ -1,0 +1,211 @@
+--- a/pim_core/includes/pimCopyLoop.h
++++ b/pim_core/includes/pimCopyLoop.h
+@@ -1,5 +1,5 @@
+ /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*\
+-       
++
+   Date      Release   Name  Ver.   Comments
+   --------- -------   ----  ----   --------
+   17-Oct-11 P-10-10   TWH   $$1    New for Creo 2
+@@ -14,17 +14,91 @@
+ #include <pimLoop.h>
+ #include <pimCab.h>
+ 
++/**
++ * Install-step (pimLoop subclass) that copies files and extracts archive
++ * payloads from a product's source media/cache into its install
++ * destination, and reverses that operation on uninstall/rollback.
++ *
++ * Note: despite the "Cab" naming inherited from this class's history and
++ * from pimCab.h, pimInstallCab()/pimRemoveCab() extract .zip archives via
++ * btkUnzip as of the most recent change to this class -- see those methods'
++ * doc comments in pimCopyLoop.cxx.
++ *
++ * Responsibilities:
++ * - Copy/extract a product's payload from Source to Dest (OnInstall).
++ * - Remove previously-extracted files on uninstall/rollback (OnRollback,
++ *   pimRemoveCab).
++ * - Track installed-size accounting (installed_size/expected_installed_size).
++ * - Support cooperative mid-copy cancellation via the process-wide
++ *   pimCancelCopy() signal (pim_util).
++ *
++ * Dependencies:
++ * - pimLoop (base class: threading/cancel/progress contract).
++ * - pim_util's pimCab.h for pimCancelCopy()/pimMinimumDiskUsage(); the
++ *   CAB-specific pimCopyCabinetArch()/pimListCabinetContent() it also
++ *   declares are no longer called from this class.
++ * - btkUnzip/btkUnzipFilelist (external, libzip-backed) for archive reading.
++ * - pimConvert for resolving XML-declared source/destination paths.
++ *
++ * Owned by: pimCopier (pim_core/includes/pimCopier.h), which lazily
++ * constructs exactly one pimCopyLoop per owning pimEntitlement.
++ */
+ class pimCopyLoop : public pimLoop
+ {
+ 	private:
+ 	int do_rollback;
+ 	int do_uninstall;
+ protected:
++	/**
++	 * Thread entry point (invoked via pimLoop::Execute()). Dispatches to
++	 * OnInstall(), OnRollback(), or OnRemoveLoadpoint() depending on the
++	 * do_rollback/do_uninstall flags set before Execute() was called.
++	 *
++	 * @return void
++	 */
+ 	void OnExecute();
++
++	/**
++	 * Main install path: iterates the bound XML's CDSECTION content,
++	 * resolves each entry's source/destination path via pimConvert, and
++	 * calls pimInstallCab() for archive entries.
++	 *
++	 * @return void
++	 */
+ 	void OnInstall();
++
++	/**
++	 * Uninstall/rollback path: calls pimRemoveCab() for each previously
++	 * installed entry recorded in the bound XML.
++	 *
++	 * @return void
++	 */
+ 	void OnRollback();
++
++	/**
++	 * Narrower rollback helper for the case where the original archives are
++	 * still present. Per its originating comment, this is intended for
++	 * future use rolling back a mid-install cancel and is not usable for the
++	 * general uninstall process.
++	 *
++	 * @return void
++	 */
+ 	void OnRollbackCabs();
++
++	/**
++	 * Deletes an entire loadpoint directory tree (used for Common Files
++	 * removal in Creo Hybrid uninstall scenarios).
++	 *
++	 * @return void
++	 */
+ 	void OnRemoveLoadpoint();
++
++	/**
++	 * Thread teardown: releases this thread's logger handle, marks the Loop
++	 * done under Mutex, and clears the in-progress flag.
++	 *
++	 * @return void
++	 */
+ 	void OnTerminate();
+ 
+ 	btkString Source;
+@@ -33,17 +107,55 @@
+ 	double expected_installed_size;
+ 	bool ignore_already_installed;
+ 
+-	bool pimInstallCab(cStringT src, cStringT dest, 
++	/**
++	 * Extracts a .zip archive (checked via GetExt().ToLower() == "zip") from
++	 * src into dest using btkUnzip, accumulating installed-size accounting
++	 * (via pimMinimumDiskUsage) for every extracted entry.
++	 *
++	 * @param src Source archive path.
++	 * @param dest Destination directory.
++	 * @param cab_installed_size Accumulator updated with the on-disk size
++	 *        estimate of every successfully extracted entry.
++	 * @param errors Receives "Zip extraction failed." or "Unexpected archive
++	 *        format." on failure.
++	 * @return true if at least one file was extracted; false otherwise.
++	 */
++	bool pimInstallCab(cStringT src, cStringT dest,
+ 		double &cab_installed_size, StringXArray &errors);
++
++	/**
++	 * Removes files previously extracted from a .zip archive at src: lists
++	 * the archive's entries via btkUnzip::GetFileList(), joins each
++	 * archive-relative name with dest, and erases the resulting file if it
++	 * exists.
++	 *
++	 * @param src Source archive path (used only to enumerate entry names).
++	 * @param dest Destination directory the entries were originally extracted into.
++	 * @param errors Receives "Zip extraction failed." on failure to read the archive.
++	 * @return true if at least one entry was found (and removal attempted); false otherwise.
++	 */
+ 	bool pimRemoveCab(cStringT src, cStringT dest, StringXArray &errors);
+ 
+ public:
++	/**
++	 * Constructs a pimCopyLoop bound to the given XML content, with
++	 * do_rollback and ignore_already_installed initialized to false.
++	 *
++	 * @param CopyXMLContent The product/entitlement XML describing what to copy.
++	 */
+ 	pimCopyLoop(pimXmlFile *CopyXMLContent) : pimLoop(CopyXMLContent)
+ 	{
+ 		do_rollback = false;
+ 		ignore_already_installed = false;
+ 	}
+ 
++	/**
++	 * Requests cancellation of the current copy/extract operation: invokes
++	 * the base pimLoop::Cancel() and additionally signals the process-wide
++	 * pimCancelCopy() flag consulted by the low-level copy routines.
++	 *
++	 * @return void
++	 */
+ 	void Cancel()
+ 	{
+ 		pimLoop::Cancel();
+@@ -53,14 +165,52 @@
+ 	/*
+ 	 * content that has attrib "installed=Y" will be removed.
+ 	 */
++	/**
++	 * Marks this Loop to run in uninstall mode (removes content flagged
++	 * installed="Y" in the bound XML) when Execute()d.
++	 *
++	 * @return void
++	 */
+ 	void SetUninstall() { do_uninstall = true; }
+ 
++	/**
++	 * Marks this Loop to run in rollback mode when Execute()d.
++	 *
++	 * @return void
++	 */
+ 	void SetRollback() { do_rollback = true; }
++
++	/**
++	 * Marks this Loop to skip entries already installed rather than re-copying them.
++	 *
++	 * @return void
++	 */
+ 	void SetIgnoreAlreadyInstalled() { ignore_already_installed = true; }
+ 
++	/**
++	 * Sets the source path (archive or directory) to copy/extract from.
++	 *
++	 * @param in Source path.
++	 * @return void
++	 */
+ 	void pimSetCopySource(btkString &in) { Source = (cStringT)in; }
++
++	/**
++	 * Sets the destination directory to copy/extract into.
++	 *
++	 * @param in Destination path.
++	 * @return void
++	 */
+ 	void pimSetDestPath(btkFSEntry &in){ Dest = (cStringT)in; }
++
++	/**
++	 * @return The accumulated on-disk size estimate (KB) of everything installed so far.
++	 */
+ 	double pimGetInstalledSize() { return installed_size; }
++
++	/**
++	 * @return The expected on-disk size estimate (KB) computed for this operation.
++	 */
+ 	double pimGetExpectedInstalledSize() { return expected_installed_size; }
+ };
+ 

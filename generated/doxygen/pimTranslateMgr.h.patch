@@ -1,0 +1,102 @@
+--- a/pim_core/includes/pimTranslateMgr.h
++++ b/pim_core/includes/pimTranslateMgr.h
+@@ -11,21 +11,96 @@
+ #include <pimCore.h>
+ #include <pimXmlFile.h>
+ 
++/**
++ * Applies a single, generic localization pass to a product XML document:
++ * given a "translation file" (one `<TRANSLATION file? element attribute
++ * attributeMatch modify?><TEXT>value</TEXT></TRANSLATION>` entry per
++ * localizable value), locate the corresponding node in the product document
++ * this instance was constructed with, and overwrite either that node's text
++ * content or one of its named attributes with the entry's `<TEXT>` value.
++ *
++ * Fully traced in a dedicated pass, see docs/classes/pimTranslateMgr.md.
++ * Of the 8 confirmed constructor call sites in this archive, only 4 are
++ * live: pim/pim_src/pimTop.cxx:477 (guarded by this file's own
++ * `#ifdef PIM_TRANSLATE_XML`), pim_core/pim_core_src/pimGetAvailable.cxx:582,
++ * and 3 near-identical sites inside
++ * pim_ui/pim_ui_src/pimEntitlementTree.cxx's OnOptionMenuSelect()
++ * (`:1885,1956,2006`) -- 2 of which trigger this class's CONFIRMED
++ * mismatched-guard bug, see TranslateFrom(pimXmlFile*) below. The other 4
++ * call sites are dead: pim_core/pim_core_src/pimEntitlement.cxx:995 (its
++ * guarding `#ifdef PIM_TRANSLATE_XML` can never be true in this translation
++ * unit -- the macro is `#define`d only in pim/pim_src/pimTop.cxx, a
++ * different unity-build target -- and conceals a compile-breaking
++ * undeclared-identifier typo, `Eptr` for `EPtr`), and 3 sites inside
++ * pim_ui_src/pimInstallMgrActions.cxx's `#if 0`-disabled `uiApplicationsList`
++ * class (already documented in docs/classes/pimGetMediaDetails.md).
++ */
+ class pimTranslateMgr
+ {
+ private:
+-	pimXmlFile *xmlProduct;
+-	btkString filename;
++	pimXmlFile *xmlProduct;   /**< The product document translations are applied to; owned by the caller, never freed here. */
++	btkString filename;   /**< The current product's own filename, used to filter `file`-scoped `<TRANSLATION>` entries. A class member (not a local): see TranslateFrom(pimXmlFile*)'s confirmed mismatched-guard bug for why this matters. */
+ 
++	/**
++	 * Resolves one `<TRANSLATION>` entry's `element`/`attribute`/`attributeMatch`
++	 * attribute triple (all 3 required) to a single DOM node in `xmlProduct`'s
++	 * document via `pimXmlFile::FindNodelistAttribMatch()` -- first
++	 * document-order match, no duplicate-name detection (the same
++	 * already-established "first match" pattern used elsewhere in this
++	 * codebase, e.g. `GetShortcutInfoByID()`).
++	 * @return the matched DOMNode, or NULL if any of the 3 attributes is
++	 *   missing or no match is found.
++	 */
+ 	DOMNode *FindNode(DOMNamedNodeMap *);
+ 
+ protected:
+-	
++
+ public:
+ 	pimTranslateMgr(pimXmlFile *product);
+ 	~pimTranslateMgr();
+ 
++	/**
++	 * Iterates every `<TRANSLATION>` node in `ptr`'s document, skips any
++	 * scoped (`file` attribute) to a different product filename, resolves
++	 * the matching target node in `xmlProduct` via FindNode(), and applies
++	 * the translation (setAttribute() if a `modify` attribute names a
++	 * target attribute, else setTextContent()).
++	 *
++	 * CONFIRMED BUG: the guard that decides whether to (re)compute
++	 * `filename` checks `ptr->getFilePath()` (the TRANSLATION document's
++	 * own path) but the value assigned comes from `xmlProduct->getFilePath()`
++	 * (a DIFFERENT object, the product document) -- checking one object's
++	 * path presence and unconditionally dereferencing the other, unguarded.
++	 * CONFIRMED REACHABLE via 2 of `pimEntitlementTree::OnOptionMenuSelect()`'s
++	 * 3 near-identical call sites (`:1956,2006`): `eptr_new_xml` there comes
++	 * straight from `pimGetMediaDetails::GetProductXml()` (which never calls
++	 * SetXml() internally) and, when `pimEntitlement::Init()` takes its
++	 * `DownloadXmlBackups` early-return branch (an already-seen MediaID),
++	 * never gets its file path set at all before reaching this method --
++	 * `filename` then ends up empty, so every `file`-scoped `<TRANSLATION>`
++	 * entry is silently skipped for those 2 arms. See
++	 * docs/classes/pimTranslateMgr.md's Risk Analysis for the full trace.
++	 *
++	 * Also confirmed: the `modify`-attribute branch only ever succeeds if
++	 * the target attribute already exists on the matched node --
++	 * setAttribute() is never reached to create a missing one (not confirmed
++	 * reachable absent a sample product/translations XML pair in this
++	 * archive, but the mechanism is fully confirmed from source).
++	 *
++	 * @return true if at least one `<TRANSLATION>` entry was successfully
++	 *   applied; false if none were (including when `ptr`/`xmlProduct` is
++	 *   NULL).
++	 */
+ 	bool TranslateFrom(pimXmlFile *);
++
++	/**
++	 * Convenience overload: reads `file` off disk into a freshly allocated,
++	 * freshly DoRead()-parsed pimXmlFile, delegates to TranslateFrom(pimXmlFile*),
++	 * and always deletes the temporary pimXmlFile on both the success and
++	 * failure paths -- verified non-issue, no leak either way.
++	 * @return the delegated call's result; false if `file` doesn't exist,
++	 *   allocation fails, or the parse fails (ErrorOccured()).
++	 */
+ 	bool TranslateFrom(btkFSEntry &);
+ };
+ 

@@ -1,0 +1,12 @@
+%% Cross-Document XML Relationships (from docs/08_xml_configuration.md §8)
+%% Source: docs/08_xml_configuration.md
+%% Extracted verbatim from the Mermaid block in that document; the source doc remains authoritative.
+
+graph LR
+    Image["Image/Media Metadata\n(§3)"] -->|"[MEDIAID], SHIPCODE/VERSION/PLATFORM properties"| Product["Product Definition\n<PRODUCT> (§2)"]
+    Product -->|"paired 1:1"| URLs["Download-URL References\n(§5)"]
+    URLs -->|"trailing filename matches CDSECTION orig_value"| Product
+    Product -->|"structural mirror, text overlay"| Translation["Translation Files (§6)"]
+    Session["Session State\n(§4)"] -->|"[SOURCE], [MEDIAID], platform/lang properties injected into each"| Product
+    Product -->|"IS_INSTALLED_FUNC references"| PrereqProduct["another <PRODUCT> (as prerequisite)"]
+    WebService["Web-Service Licensing Messages (§7)"] -.->|"independent of local XML; drives license-source/session state"| Session
